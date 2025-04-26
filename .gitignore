@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+models/
+bot.db
+trading_log.txt
+*.h5
+*.scaler
+config.toml

@@ -1,0 +1,46 @@
+##Time‑Series Forecasting & Adaptive Retraining Pipeline
+
+This project implements a fully automated workflow for forecasting major market indices, evaluating model performance, and adaptively retraining LSTM-based forecasting models. The pipeline consists of:
+
+## FILES
+- bot_core.py – Core logic for data ingestion, feature engineering, model training/tuning, forecasting, backtesting, and performance evaluation.
+- jobs.py – CLI entrypoint defining three jobs:
+- storage.py – SQLite utilities for storing forecasts and evaluation errors, with helper to retrieve recent errors for adaptive retraining.
+- alert.py – Telegram integration to push forecast, evaluation, and retraining notifications.
+
+## COMMANDS
+- forecast → run daily at 07:00, generates price forecasts and sends alerts.
+- evaluate → run daily after market close, compares forecasts to actuals, stores error metrics, and notifies results.
+- retrain → run weekly (or on demand), retrains models using walk‑forward cross‑validation and enriched feature set.
+
+- python jobs.py retrain
+- python jobs.py forecast
+
+Scheduled Tasks:
+– Windows Task Scheduler XML/GUI configurations automate each job, including waking the PC, missed‑run catch‑up, and highest privileges.
+
+Key Features
+
+1. Enriched Feature Engineering
+    Standard Indicators: 20‑day & 50‑day SMA, 14‑day RSI.
+    Advanced Indicators: MACD (12/26 EMA difference), ATR (14‑day range), 10‑day Rate‑of‑Change.
+    Clean handling of missing data and forward‑fill for continuity.
+
+2. Robust Model Tuning & Training
+    Walk‑Forward Cross‑Validation: Uses TimeSeriesSplit to hyperoptimize LSTM architecture across multiple chronological folds.
+    Hyperparameter Search: keras_tuner.Hyperband explores LSTM units, dropout rates, and optional second layer.
+    Adaptive Retraining: Retraining only triggers when recent forecast errors exceed a configurable threshold (default: 2% MAPE over last 7 days).
+
+3. Automated Workflow & Alerts
+    Forecast Job: Downloads 30 years of daily data via yfinance, scales features, runs or loads the model, produces a closing‑price forecast, and sends a Telegram summary.
+    Evaluate Job: Compares yesterday’s forecast to actual close, records error metrics, and notifies accuracy and error percentage.
+    Retrain Job: Builds new models weekly (or on demand), stores them in models/, and notifies with model details.
+
+4. Backtesting & Interpretability
+    Directional Accuracy & Cumulative Return: Quantitative metrics comparing predicted sign vs actual sign and hypothetical PnL.
+    Feature Sensitivity: TensorFlow GradientTape analysis to quantify input importance for interpretability.
+    Certificate Recommendation: Generates bullish/bearish certificate advice with leverage sizing based on predicted move and volatility.
+
+
+
+
