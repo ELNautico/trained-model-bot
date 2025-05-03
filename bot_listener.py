@@ -43,11 +43,18 @@ async def retrain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🕑 Retraining all models… this may take a while.")
     subprocess.Popen([PYTHON, JOBS, "retrain"])
 
+@restricted
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📬 Sending help instructions…")
+    subprocess.Popen([PYTHON, JOBS, "help"])
+
+
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("forecast", forecast))
     app.add_handler(CommandHandler("evaluate", evaluate))
     app.add_handler(CommandHandler("retrain", retrain))
+    app.add_handler(CommandHandler("help", help_command))
     app.run_polling()
 
 if __name__ == "__main__":

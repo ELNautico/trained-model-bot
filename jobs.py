@@ -196,6 +196,22 @@ def retrain_job(force: bool = False):
             logging.error(f"❌ Training error for {tkr}: {e}")
             send(f"❌ Error retraining {label}: {e}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELP COMMAND JOB
+# ─────────────────────────────────────────────────────────────────────────────
+def help_job():
+    help_text = (
+        "🧠 *Available Commands:*\n\n"
+        "/forecast – Run model and send today's market predictions.\n"
+        "/evaluate – Compare today's forecasts to actual prices.\n"
+        "/retrain – Force retraining of all models.\n"
+        "/retrain_force – Same as retrain, but overrides existing models.\n"
+        "/help – Show this list of available commands.\n"
+        "\nAll times are UTC and predictions are saved to the database."
+    )
+    send(help_text)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI ENTRYPOINT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,14 +220,19 @@ def _cli():
 
     init_db()
     job = sys.argv[1] if len(sys.argv) > 1 else None
+
     if job == "forecast":
         forecast_job()
     elif job == "evaluate":
         evaluate_job()
     elif job == "retrain":
-        retrain_job()
+        retrain_job(force=False)
+    elif job == "retrain_force":
+        retrain_job(force=True)
+    elif job == "help":
+        help_job()
     else:
-        print("Usage: jobs.py [forecast|evaluate|retrain]")
+        print("Usage: jobs.py [forecast|evaluate|retrain|retrain_force|help]")
 
 if __name__ == "__main__":
     _cli()
