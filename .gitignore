@@ -1,9 +1,15 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-models/
-bot.db
-trading_log.txt
+*.py[cod]
+*.egg-info/
+env/
+.venv/
+# TensorFlow/Keras artifacts
 *.h5
-*.scaler
-config.toml
+models/
+# Logs / DB
+trading_log.txt
+bot.db
+# IDE
+.vscode/
+tuning_logs/

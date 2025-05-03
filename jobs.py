@@ -1,95 +1,131 @@
 # jobs.py
-from datetime import datetime
+
 import logging
 import sqlite3
 import os
 import pathlib
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
 
 from storage import init_db, save_forecast, save_evaluation, DB
 from alert import send
-from bot_core import (
-    train_predict_for_ticker,
-    prepare_data_and_split,
-    tune_and_train_model,
-    download_daily_data,
-    prepare_data_full,
-)
+from train.pipeline import train_predict_for_ticker, download_data
+from train.core import train_and_save_model
+from core.utils import timestamp_now
+from core.indicators import add_basic_indicators
+from train.pipeline import prepare_data_and_split
+from train.core import predict_price
+from train.evaluate import backtest_strategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 TICKERS = {
-    "S&P 500": "^GSPC",
     "DAX": "^GDAXI",
+    "S&P 500": "^GSPC",
     "NASDAQ": "^IXIC",
     "ATX": "^ATX",
 }
 MODEL_TAG = "v2025Q2"
 ACCT_BAL = 100_000
 RISK = 0.01
-MODEL_DIR = pathlib.Path(__file__).with_name("models")
+MODEL_DIR = pathlib.Path("models")
 
-# map each ticker to its exchange calendar
 CALENDARS = {
     "^GSPC": "NYSE",
     "^IXIC": "NASDAQ",
     "^GDAXI": "XETR",
-    "^ATX": "XETR",       # Vienna will use XETR calendar as a proxy
+    "^ATX": "XETR",
 }
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILITY: skip non‐trading days
+# Check if all exchanges are open today
 # ─────────────────────────────────────────────────────────────────────────────
 def is_trading_day_all() -> bool:
     today = datetime.utcnow().date()
     for cal_name in set(CALENDARS.values()):
         cal = mcal.get_calendar(cal_name)
-        # get schedule for today
         sched = cal.schedule(start_date=today, end_date=today)
         if sched.empty:
             return False
     return True
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# JOBS
+# FORECAST JOB
 # ─────────────────────────────────────────────────────────────────────────────
 def forecast_job():
     if not is_trading_day_all():
-        logging.info("Market closed today – skipping forecast_job.")
-        send("🛑 Market is closed today")
+        logging.info("Market closed today – skipping forecast job.")
+        send("🛑 Market closed today – skipping forecast job.")
         return
 
     for label, tkr in TICKERS.items():
-        res, _ = train_predict_for_ticker(
-            tkr,
-            use_ensemble=True,
-            account_balance=ACCT_BAL,
-            risk_per_trade=RISK,
+        try:
+            result, _ = train_predict_for_ticker(
+                tkr,
+                use_ensemble=True,
+                account_balance=ACCT_BAL,
+                risk_per_trade=RISK,
+            )
+            res = {
+                "Current Price": result["Current Price"],
+                "Predicted Price": result["Predicted Price"],
+                "Predicted % Change": result["Predicted % Change"],
+                "Confidence": result["Confidence"],
+            }
+        except ValueError as e:
+            if "Not enough data" in str(e):
+                logging.warning(f"{tkr}: fallback to SMA-20 due to insufficient data.")
+                data = download_data(tkr)
+                data = add_basic_indicators(data)
+                sma20 = data["SMA_20"].iloc[-1]
+                current = float(data["Close"].iloc[-1])
+
+                ts = data.index[-1]
+                ts = ts if ts.tzinfo else ts.replace(tzinfo=ZoneInfo("UTC"))
+                ts_local = ts.astimezone(ZoneInfo("Europe/Vienna"))
+
+                res = {
+                    "Current Price": current,
+                    "Predicted Price": float(sma20),
+                    "Predicted % Change": 0.0,
+                    "Confidence": 0.0,
+                }
+            else:
+                raise
+
+        direction = (
+            "Buy" if res["Predicted % Change"] > 0
+            else "Sell" if res["Predicted % Change"] < 0
+            else "Hold"
         )
+
         row = dict(
             ts=datetime.utcnow().date().isoformat(),
             ticker=tkr,
             current_px=res["Current Price"],
-            predicted_px=res["Predicted Price for Close"],
-            direction=res["Trade Decision"],
-            confidence=res["Signal Confidence"],
+            predicted_px=res["Predicted Price"],
+            direction=direction,
+            confidence=res["Confidence"],
             model_tag=MODEL_TAG,
         )
         save_forecast(row)
         send(
             f"📈 {label}: {row['direction']}\n"
-            f"Predicted Closing Price: {row['predicted_px']:.2f} (conf {row['confidence']:.1f}%)"
+            f"Predicted Closing Price: {row['predicted_px']:.2f} "
+            f"(conf {row['confidence']:.1f}%)"
         )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATE JOB
+# ─────────────────────────────────────────────────────────────────────────────
 def evaluate_job():
     if not is_trading_day_all():
-        logging.info("Market closed today – skipping evaluate_job.")
-        send("🛑 Market is closed today")
+        logging.info("Market closed today – skipping forecast job.")
+        send("🛑 Market closed today – skipping forecast job.")
         return
 
     init_db()
@@ -97,59 +133,71 @@ def evaluate_job():
 
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT ticker, predicted_px, model_tag FROM forecast WHERE ts = ?",
-        (today,),
-    )
+    cur.execute("SELECT ticker, predicted_px, model_tag FROM forecast WHERE ts = ?", (today,))
     forecasts = cur.fetchall()
     conn.close()
 
     for tkr, predicted_px, model_tag in forecasts:
-        data = download_daily_data(tkr)
-        actual_close = float(data["Close"].iloc[-1])
-        error = actual_close - predicted_px
-        pct_error = (error / actual_close) * 100
+        try:
+            data = download_data(tkr)
+            actual_close = float(data["Close"].iloc[-1])
+            error = actual_close - predicted_px
+            pct_error = (error / actual_close) * 100
 
-        eval_row = dict(
-            ts=today,
-            ticker=tkr,
-            predicted_px=predicted_px,
-            actual_px=actual_close,
-            error=error,
-            pct_error=pct_error,
-            model_tag=model_tag,
-        )
-        save_evaluation(eval_row)
-        send(
-            f"✅ {tkr}: Predicted {predicted_px:.2f}, Actual {actual_close:.2f}, "
-            f"Err {error:.2f} ({pct_error:.1f}%)"
-        )
+            eval_row = dict(
+                ts=today,
+                ticker=tkr,
+                predicted_px=predicted_px,
+                actual_px=actual_close,
+                error=error,
+                pct_error=pct_error,
+                model_tag=model_tag,
+            )
+            save_evaluation(eval_row)
 
-
-def retrain_job():
-    MODEL_DIR.mkdir(exist_ok=True)
-    for label, tkr in TICKERS.items():
-        data = download_daily_data(tkr)
-        X, y, scaler = prepare_data_full(data, window_size=60)
-
-        model, _, best_hp = tune_and_train_model(
-            X,
-            y,
-            input_shape=(X.shape[1], X.shape[2]),
-            project_name=f"live_{tkr}",
-        )
-        tag = datetime.utcnow().strftime("%Y%m%d_%H%M")
-        fname = MODEL_DIR / f"{tkr}_{tag}.h5"
-        model.save(fname)
-
-        import joblib
-
-        joblib.dump(scaler, pathlib.Path(fname).with_suffix(".scaler"))
-        send(f"🆕 {label} model retrained")
-
+            send(
+                f"✅ {tkr} Evaluation:\n"
+                f"Predicted: {predicted_px:.2f}, Actual: {actual_close:.2f}\n"
+                f"Error: {error:.2f} ({pct_error:.1f}%)"
+            )
+            logging.info(f"Saved evaluation for {tkr} – error {error:.2f} ({pct_error:.1f}%)")
+        except Exception as e:
+            logging.error(f"❌ Evaluation failed for {tkr}: {e}")
+            send(f"❌ Evaluation failed for {tkr}: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI
+# RETRAIN JOB
+# ─────────────────────────────────────────────────────────────────────────────
+def retrain_job(force: bool = False):
+    MODEL_DIR.mkdir(exist_ok=True)
+    for label, tkr in TICKERS.items():
+        logging.info(f"🔄 Retraining model for {label} ({tkr})")
+        try:
+            data = download_data(tkr)
+            X, y, scaler = prepare_data_and_split(data, window_size=60)[0:3]
+        except Exception as e:
+            logging.error(f"❌ Failed to prepare data for {tkr}: {e}")
+            continue
+
+        if len(X) < 100:
+            logging.warning(f"⚠️ Not enough samples to train {tkr}, skipping.")
+            continue
+
+        model_path = MODEL_DIR / f"{tkr}_model.h5"
+        if model_path.exists() and not force:
+            logging.info(f"✔️ Model for {tkr} already exists. Skipping (use force=True to retrain).")
+            continue
+
+        try:
+            model, _, _ = train_and_save_model(X, y, X.shape[1:], tkr)
+            model.save(model_path)
+            send(f"✅ {label}: Model retrained and saved.")
+        except Exception as e:
+            logging.error(f"❌ Training error for {tkr}: {e}")
+            send(f"❌ Error retraining {label}: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI ENTRYPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 def _cli():
     import sys
@@ -164,7 +212,6 @@ def _cli():
         retrain_job()
     else:
         print("Usage: jobs.py [forecast|evaluate|retrain]")
-
 
 if __name__ == "__main__":
     _cli()
