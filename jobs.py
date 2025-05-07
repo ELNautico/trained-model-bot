@@ -2,46 +2,42 @@
 
 import logging
 import sqlite3
-import os
+import time
 import pathlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
 
-from storage import init_db, save_forecast, save_evaluation, DB
+from storage import (
+    init_db,
+    save_forecast,
+    save_evaluation,
+    DB,
+    get_watchlist,
+    update_watchlist_timestamp,
+)
 from alert import send
-from train.pipeline import train_predict_for_ticker, download_data
+from train.pipeline import train_predict_for_ticker, prepare_data_and_split, download_data
 from train.core import train_and_save_model
-from core.utils import timestamp_now
-from core.indicators import add_basic_indicators
-from train.pipeline import prepare_data_and_split
-from train.core import predict_price
-from train.evaluate import backtest_strategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-TICKERS = {
-    "DAX": "^GDAXI",
-    "S&P 500": "^GSPC",
-    "NASDAQ": "^IXIC",
-    "ATX": "^ATX",
-}
+
 MODEL_TAG = "v2025Q2"
 ACCT_BAL = 100_000
 RISK = 0.01
 MODEL_DIR = pathlib.Path("models")
 
+# Optional: adjust or disable if not all tickers match known calendars
 CALENDARS = {
-    "^GSPC": "NYSE",
-    "^IXIC": "NASDAQ",
-    "^GDAXI": "XETR",
-    "^ATX": "XETR",
+    "SPX": "NYSE",
+    "NAS100": "NASDAQ",
+    "DEU40": "XETR",
+    "ATX": "XETR",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Check if all exchanges are open today
 # ─────────────────────────────────────────────────────────────────────────────
 def is_trading_day_all() -> bool:
     today = datetime.utcnow().date()
@@ -53,18 +49,17 @@ def is_trading_day_all() -> bool:
     return True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FORECAST JOB
-# ─────────────────────────────────────────────────────────────────────────────
 def forecast_job():
     if not is_trading_day_all():
         logging.info("Market closed today – skipping forecast job.")
         send("🛑 Market closed today – skipping forecast job.")
         return
 
-    for label, tkr in TICKERS.items():
+    for ticker in get_watchlist():
+        time.sleep(3)
         try:
             result, _ = train_predict_for_ticker(
-                tkr,
+                ticker,
                 use_ensemble=True,
                 account_balance=ACCT_BAL,
                 risk_per_trade=RISK,
@@ -75,57 +70,38 @@ def forecast_job():
                 "Predicted % Change": result["Predicted % Change"],
                 "Confidence": result["Confidence"],
             }
-        except ValueError as e:
-            if "Not enough data" in str(e):
-                logging.warning(f"{tkr}: fallback to SMA-20 due to insufficient data.")
-                data = download_data(tkr)
-                data = add_basic_indicators(data)
-                sma20 = data["SMA_20"].iloc[-1]
-                current = float(data["Close"].iloc[-1])
 
-                ts = data.index[-1]
-                ts = ts if ts.tzinfo else ts.replace(tzinfo=ZoneInfo("UTC"))
-                ts_local = ts.astimezone(ZoneInfo("Europe/Vienna"))
+            direction = (
+                "Buy" if res["Predicted % Change"] > 0
+                else "Sell" if res["Predicted % Change"] < 0
+                else "Hold"
+            )
 
-                res = {
-                    "Current Price": current,
-                    "Predicted Price": float(sma20),
-                    "Predicted % Change": 0.0,
-                    "Confidence": 0.0,
-                }
-            else:
-                raise
+            row = dict(
+                ts=datetime.utcnow().date().isoformat(),
+                ticker=ticker,
+                current_px=res["Current Price"],
+                predicted_px=res["Predicted Price"],
+                direction=direction,
+                confidence=res["Confidence"],
+                model_tag=MODEL_TAG,
+            )
+            save_forecast(row)
+            update_watchlist_timestamp(ticker, "last_forecast")
+            send(
+                f"📈 {ticker}: {direction}\n"
+                f"Predicted Close: {res['Predicted Price']:.2f} "
+                f"(conf {res['Confidence']:.1f}%)"
+            )
+        except Exception as e:
+            logging.error(f"{ticker}: Forecast failed – {e}")
+            send(f"❌ {ticker}: Forecast failed – {e}")
 
-        direction = (
-            "Buy" if res["Predicted % Change"] > 0
-            else "Sell" if res["Predicted % Change"] < 0
-            else "Hold"
-        )
-
-        row = dict(
-            ts=datetime.utcnow().date().isoformat(),
-            ticker=tkr,
-            current_px=res["Current Price"],
-            predicted_px=res["Predicted Price"],
-            direction=direction,
-            confidence=res["Confidence"],
-            model_tag=MODEL_TAG,
-        )
-        save_forecast(row)
-        send(
-            f"📈 {label}: {row['direction']}\n"
-            f"Predicted Closing Price: {row['predicted_px']:.2f} "
-            f"(conf {row['confidence']:.1f}%)"
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EVALUATE JOB
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate_job():
     if not is_trading_day_all():
-        logging.info("Market closed today – skipping forecast job.")
-        send("🛑 Market closed today – skipping forecast job.")
+        logging.info("Market closed today – skipping evaluation job.")
+        send("🛑 Market closed today – skipping evaluation job.")
         return
 
     init_db()
@@ -139,8 +115,8 @@ def evaluate_job():
 
     for tkr, predicted_px, model_tag in forecasts:
         try:
-            data = download_data(tkr)
-            actual_close = float(data["Close"].iloc[-1])
+            df = download_data(tkr)
+            actual_close = float(df["Close"].iloc[-1])
             error = actual_close - predicted_px
             pct_error = (error / actual_close) * 100
 
@@ -166,58 +142,54 @@ def evaluate_job():
             send(f"❌ Evaluation failed for {tkr}: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RETRAIN JOB
-# ─────────────────────────────────────────────────────────────────────────────
 def retrain_job(force: bool = False):
     MODEL_DIR.mkdir(exist_ok=True)
-    for label, tkr in TICKERS.items():
-        logging.info(f"🔄 Retraining model for {label} ({tkr})")
+    for ticker in get_watchlist():
+        logging.info(f"🔄 Retraining model for {ticker}")
         try:
-            data = download_data(tkr)
-            X, y, scaler = prepare_data_and_split(data, window_size=60)[0:3]
+            df = download_data(ticker)
+            X, y, scaler = prepare_data_and_split(df, window_size=60)[0:3]
         except Exception as e:
-            logging.error(f"❌ Failed to prepare data for {tkr}: {e}")
+            logging.error(f"❌ Failed to prepare data for {ticker}: {e}")
             continue
 
         if len(X) < 100:
-            logging.warning(f"⚠️ Not enough samples to train {tkr}, skipping.")
+            logging.warning(f"⚠️ Not enough samples to train {ticker}, skipping.")
             continue
 
-        model_path = MODEL_DIR / f"{tkr}_model.h5"
+        model_path = MODEL_DIR / f"{ticker}_model.h5"
         if model_path.exists() and not force:
-            logging.info(f"✔️ Model for {tkr} already exists. Skipping (use force=True to retrain).")
+            logging.info(f"✔️ Model for {ticker} already exists. Skipping.")
             continue
 
         try:
-            model, _, _ = train_and_save_model(X, y, X.shape[1:], tkr)
+            model, _, _ = train_and_save_model(X, y, X.shape[1:], ticker)
             model.save(model_path)
-            send(f"✅ {label}: Model retrained and saved.")
+            update_watchlist_timestamp(ticker, "last_trained")
+            send(f"✅ {ticker}: Model retrained and saved.")
         except Exception as e:
-            logging.error(f"❌ Training error for {tkr}: {e}")
-            send(f"❌ Error retraining {label}: {e}")
+            logging.error(f"❌ Training error for {ticker}: {e}")
+            send(f"❌ Error retraining {ticker}: {e}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELP COMMAND JOB
 # ─────────────────────────────────────────────────────────────────────────────
 def help_job():
     help_text = (
         "🧠 *Available Commands:*\n\n"
-        "/forecast – Run model and send today's market predictions.\n"
-        "/evaluate – Compare today's forecasts to actual prices.\n"
-        "/retrain – Force retraining of all models.\n"
-        "/retrain_force – Same as retrain, but overrides existing models.\n"
-        "/help – Show this list of available commands.\n"
-        "\nAll times are UTC and predictions are saved to the database."
+        "📈 /forecast – Run model and send today's market predictions.\n\n"
+        "📊 /evaluate – Compare today's forecasts to actual prices.\n\n"
+        "🔄 /retrain – Retrain models only if missing.\n\n"
+        "⚠️ /retrain_force – Force retraining of all models, even if already trained.\n\n"
+        "📥 /add TICKER – Add a stock ticker to your watchlist (e.g. `/add AAPL`).\n\n"
+        "🗑️ /remove TICKER – Remove a stock from your watchlist.\n\n"
+        "📋 /watchlist – Show all currently watched tickers.\n\n"
+        "❓ /help – Show this list of available commands.\n\n"
+        "📅 *Note:* All times are UTC and forecasts are stored in the database."
     )
     send(help_text)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI ENTRYPOINT
-# ─────────────────────────────────────────────────────────────────────────────
 def _cli():
     import sys
-
     init_db()
     job = sys.argv[1] if len(sys.argv) > 1 else None
 

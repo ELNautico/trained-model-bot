@@ -5,7 +5,6 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
-from core.logging import ProgressCallback
 from core.build import tune_model
 
 
@@ -20,7 +19,6 @@ def train_and_save_model(X_train, y_train, input_shape, ticker):
     callbacks = [
         tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
         tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3, min_lr=1e-5),
-        ProgressCallback(label=ticker, notify_every_n_epochs=5)
     ]
 
     history = model.fit(
