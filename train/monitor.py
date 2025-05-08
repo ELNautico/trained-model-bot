@@ -1,5 +1,3 @@
-# train/monitor.py
-
 import logging
 import time
 from core.risk import determine_trade_signal, determine_position_size

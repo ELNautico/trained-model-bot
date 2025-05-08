@@ -1,21 +1,17 @@
-# train/pipeline.py
-
 import logging
 import hashlib
-import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import toml
-import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 from twelvedata import TDClient
 import joblib
 
-from core.indicators import add_basic_indicators, add_richer_features, get_feature_columns
+from core.features import enrich_features, get_feature_columns
 from core.sensitivity import compute_feature_sensitivity
 from core.risk import generate_certificate
 from core.utils import directional_accuracy
@@ -33,90 +29,139 @@ td = TDClient(apikey=api_key)
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
+# Cache settings
+CACHE_TTL = timedelta(hours=24)
+MAX_RETURN_THRESHOLD = 0.1   # 10% daily return
+MAX_STALE_DAYS = 2
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA HANDLING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def cached_download(ticker):
+
+def _download_and_cache(ticker: str, path: Path) -> pd.DataFrame:
+    """
+    Internal helper: download, normalize, cache, return DataFrame.
+    """
+    df = td.time_series(
+        symbol=ticker,
+        interval="1day",
+        outputsize=5000,
+        timezone="UTC"
+    ).as_pandas()
+
+    if df.empty:
+        raise ValueError(f"Downloaded data for {ticker} is empty.")
+
+    # Standardize column names
+    df.columns = [col.strip().lower() for col in df.columns]
+    df.rename(columns={
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume"
+    }, inplace=True)
+
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing expected columns: {missing}")
+
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    logging.info(f"✅ Downloaded and normalized data for {ticker}")
+
+    joblib.dump(df, path)
+    return df
+
+
+def cached_download(ticker: str) -> pd.DataFrame:
+    """
+    Downloads OHLCV data, caching to disk with a 24h TTL. Also removes outliers and stale rows.
+    """
     key = hashlib.md5(ticker.encode()).hexdigest()
     path = CACHE_DIR / f"{key}.pkl"
 
+    # Load from cache if fresh
     if path.exists():
-        logging.info(f"📦 Loaded cached data for {ticker}")
-        return joblib.load(path)
+        mtime = datetime.utcfromtimestamp(path.stat().st_mtime)
+        if datetime.utcnow() - mtime < CACHE_TTL:
+            logging.info(f"📦 Loaded cached data for {ticker}")
+            df = joblib.load(path)
+        else:
+            logging.info(f"🕑 Cache expired for {ticker}, re-downloading...")
+            df = _download_and_cache(ticker, path)
+    else:
+        df = _download_and_cache(ticker, path)
 
-    try:
-        df = td.time_series(
-            symbol=ticker,
-            interval="1day",
-            outputsize=5000,
-            timezone="UTC"
-        ).as_pandas()
+    # Outlier detection: drop extreme returns
+    df['return'] = df['Close'].pct_change()
+    outliers = df['return'].abs() > MAX_RETURN_THRESHOLD
+    if outliers.any():
+        logging.warning(f"⚠️ Dropping {outliers.sum()} outlier rows for {ticker}")
+        df = df.loc[~outliers]
 
-        if df.empty:
-            raise ValueError(f"Downloaded data for {ticker} is empty.")
+    # Staleness detection: drop gaps > MAX_STALE_DAYS
+    gaps = df.index.to_series().diff()
+    stale = gaps > pd.Timedelta(days=MAX_STALE_DAYS)
+    if stale.any():
+        logging.warning(f"⚠️ Dropping {stale.sum()} stale rows for {ticker}")
+        df = df.loc[~stale]
 
-        # Lowercase all columns first
-        df.columns = [col.strip().lower() for col in df.columns]
-
-        # Rename the core OHLCV columns to expected format
-        df.rename(columns={
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume"
-        }, inplace=True)
-
-        required = {"Open", "High", "Low", "Close", "Volume"}
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"Missing expected columns: {missing}")
-
-        df.index = pd.to_datetime(df.index)
-        df = df.sort_index()
-
-        logging.info(f"✅ Normalized data columns for {ticker}: {list(df.columns)}")
-
-        joblib.dump(df, path)
-        return df
-
-    except Exception as e:
-        logging.error(f"❌ Failed to download data for {ticker}: {e}")
-        return pd.DataFrame()
-
+    df.drop(columns=['return'], inplace=True)
+    return df
 
 
 def prepare_data_and_split(df: pd.DataFrame, window_size: int = 60, test_ratio: float = 0.2):
-    df = add_basic_indicators(df)
-    df = add_richer_features(df)
+    """
+    Enrich features, apply caching outlier/stale-cleaned data,
+    then scale inputs+target with a single MinMaxScaler for stability.
 
+    Returns:
+        X_train, y_train, X_test, y_test, scaler, train_size
+    """
+    # Feature engineering
+    df = enrich_features(df)
+
+    # Subset and clean
     feature_cols = get_feature_columns()
     df = df[feature_cols].copy().ffill().bfill().dropna()
 
     if len(df) < window_size + 5:
-        raise ValueError(f"Not enough data to build sequences. Got only {len(df)} rows after cleaning.")
+        raise ValueError(
+            f"Not enough data to build sequences. Got only {len(df)} rows after cleaning."
+        )
 
+    # Train/test split
     split_idx = int(len(df) * (1 - test_ratio))
-    train_df, test_df = df.iloc[:split_idx], df.iloc[split_idx:]
+    train_df = df.iloc[:split_idx]
+    test_df = df.iloc[split_idx:]
 
+    # Scale both features+target
     scaler = MinMaxScaler()
     scaler.fit(train_df)
     train_scaled = scaler.transform(train_df)
     test_scaled = scaler.transform(test_df)
 
-    def build_sequences(scaled_data, unscaled_df):
+    # Identify target column index
+    target_idx = feature_cols.index('Close')
+
+    # Build sequences for X and y (scaled target)
+    def build_sequences(scaled_array):
         X, y = [], []
-        for i in range(window_size, len(scaled_data)):
-            X.append(scaled_data[i - window_size:i])
-            y.append(unscaled_df.iloc[i]['Close'])
+        for i in range(window_size, len(scaled_array)):
+            X.append(scaled_array[i - window_size:i])
+            y.append(scaled_array[i][target_idx])
         return np.array(X), np.array(y)
 
-    X_train, y_train = build_sequences(train_scaled, train_df)
-    X_test, y_test = build_sequences(test_scaled, test_df)
+    X_train, y_train = build_sequences(train_scaled)
+    X_test, y_test = build_sequences(test_scaled)
 
     if len(X_train) == 0 or len(X_test) == 0:
-        raise ValueError("Train/Test sequences are empty. Check window size or data size.")
+        raise ValueError(
+            "Train/Test sequences are empty. Check window size or data size."
+        )
 
     return X_train, y_train, X_test, y_test, scaler, len(X_train)
 

@@ -1,81 +1,71 @@
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-import keras_tuner as kt
 import numpy as np
+import keras_tuner as kt
+from sklearn.model_selection import TimeSeriesSplit
+
+from core.lstm_utils import estimate_huber_delta, build_lstm_model
 
 
-def estimate_huber_delta(y_train):
-    """
-    Estimate a robust delta for the Huber loss function
-    based on the distribution of training targets.
-    """
-    median_abs = np.median(np.abs(y_train - np.median(y_train)))
-    return 5 * median_abs
+class TimeSeriesHyperband(kt.Hyperband):
+    def run_trial(self, trial, X, y, **kwargs):
+        hp = trial.hyperparameters
+        huber_delta = estimate_huber_delta(y)
 
+        # build model factory
+        def mk_model():
+            return build_lstm_model(hp, X.shape[1:], huber_delta)
 
-def build_model(hp, input_shape, huber_delta=None):
-    """
-    Builds a compiled LSTM model using hyperparameters from keras-tuner.
-    """
-    model = keras.Sequential()
-    model.add(layers.Input(shape=input_shape))
+        tscv = TimeSeriesSplit(n_splits=3)
+        losses = []
+        for train_idx, val_idx in tscv.split(X):
+            m = mk_model()
+            m.fit(X[train_idx], y[train_idx], epochs=10, verbose=0)
+            losses.append(m.evaluate(X[val_idx], y[val_idx], verbose=0)[0])
 
-    units = hp.Int('units', min_value=32, max_value=128, step=32)
-    dropout = hp.Float('dropout', 0.0, 0.5, step=0.1)
-
-    model.add(layers.LSTM(units, return_sequences=True))
-    model.add(layers.Dropout(dropout))
-
-    if hp.Boolean('use_second_lstm'):
-        units2 = hp.Int('units2', 32, 128, step=32)
-        model.add(layers.LSTM(units2))
-        model.add(layers.Dropout(dropout))
-    else:
-        model.add(layers.LSTM(units))
-        model.add(layers.Dropout(dropout))
-
-    model.add(layers.Dense(1))
-
-    lr = hp.Float('learning_rate', 1e-4, 1e-2, sampling='log')
-    loss = tf.keras.losses.Huber(delta=huber_delta) if huber_delta else 'mse'
-
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss=loss,
-        metrics=['mae', 'mape']
-    )
-    return model
-
+        mean_loss = float(np.mean(losses))
+        # report under the name your objective expects:
+        self.oracle.update_trial(trial.trial_id, {"val_loss": mean_loss})
 
 def tune_model(X_train, y_train, input_shape, project_name):
+    huber_delta = estimate_huber_delta(y_train)
+    tuner = TimeSeriesHyperband(
+        hypermodel=lambda hp: build_lstm_model(hp, input_shape, huber_delta),
+        objective=kt.Objective("val_loss", "min"),
+        max_epochs=30, factor=3,
+        directory="tuning_logs", project_name=project_name,
+        overwrite=True,
+    )
+    # Pass X and y, our run_trial handles all CV
+    tuner.search(X_train, y_train, verbose=1)
+    best_hp = tuner.get_best_hyperparameters(1)[0]
+    return build_lstm_model(best_hp, input_shape, huber_delta), best_hp
+
+# --- Optional: Bayesian search variant for even faster convergence --- #
+
+def bayesian_tune(X_train, y_train, input_shape, project_name, max_trials=20, init_points=5):
     """
-    Tunes hyperparameters using KerasTuner's Hyperband search.
+    Tune hyperparameters with BayesianOptimization.
+    Falls back to using built-in validation_split, but you could
+    similarly subclass the Bayesian optimizer to inject CV.
     """
     huber_delta = estimate_huber_delta(y_train)
 
-    tuner = kt.Hyperband(
-        lambda hp: build_model(hp, input_shape, huber_delta),
-        objective='val_loss',
-        max_epochs=30,
-        factor=3,
-        executions_per_trial=2,
-        directory='tuning_logs',
-        project_name=project_name,
-        overwrite=True
+    tuner = kt.BayesianOptimization(
+        hypermodel=lambda hp: build_lstm_model(hp, input_shape, huber_delta),
+        objective=kt.Objective("val_loss", "min"),
+        max_trials=max_trials,
+        num_initial_points=init_points,
+        directory="tuning_logs",
+        project_name=project_name + "_bayes",
+        overwrite=True,
     )
-
-    early_stop = keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-    reduce_lr = keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-5)
 
     tuner.search(
         X_train, y_train,
         validation_split=0.2,
         epochs=30,
-        callbacks=[early_stop, reduce_lr],
-        verbose=1
+        verbose=1,
     )
 
-    best_hp = tuner.get_best_hyperparameters(1)[0]
-    best_model = build_model(best_hp, input_shape, huber_delta)
+    best_hp = tuner.get_best_hyperparameters(num_trials=1)[0]
+    best_model = build_lstm_model(best_hp, input_shape, huber_delta)
     return best_model, best_hp

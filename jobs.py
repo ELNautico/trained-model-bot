@@ -5,7 +5,6 @@ import sqlite3
 import time
 import pathlib
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
 
@@ -30,7 +29,6 @@ ACCT_BAL = 100_000
 RISK = 0.01
 MODEL_DIR = pathlib.Path("models")
 
-# Optional: adjust or disable if not all tickers match known calendars
 CALENDARS = {
     "SPX": "NYSE",
     "NAS100": "NASDAQ",
@@ -109,7 +107,9 @@ def evaluate_job():
 
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT ticker, predicted_px, model_tag FROM forecast WHERE ts = ?", (today,))
+    cur.execute(
+        "SELECT ticker, predicted_px, model_tag FROM forecast WHERE ts = ?", (today,)
+    )
     forecasts = cur.fetchall()
     conn.close()
 
@@ -136,7 +136,9 @@ def evaluate_job():
                 f"Predicted: {predicted_px:.2f}, Actual: {actual_close:.2f}\n"
                 f"Error: {error:.2f} ({pct_error:.1f}%)"
             )
-            logging.info(f"Saved evaluation for {tkr} – error {error:.2f} ({pct_error:.1f}%)")
+            logging.info(
+                f"Saved evaluation for {tkr} – error {error:.2f} ({pct_error:.1f}%)"
+            )
         except Exception as e:
             logging.error(f"❌ Evaluation failed for {tkr}: {e}")
             send(f"❌ Evaluation failed for {tkr}: {e}")
@@ -148,13 +150,16 @@ def retrain_job(force: bool = False):
         logging.info(f"🔄 Retraining model for {ticker}")
         try:
             df = download_data(ticker)
-            X, y, scaler = prepare_data_and_split(df, window_size=60)[0:3]
+            # Only unpack training sequences
+            X_train, y_train, *_ = prepare_data_and_split(df, window_size=60)
         except Exception as e:
             logging.error(f"❌ Failed to prepare data for {ticker}: {e}")
             continue
 
-        if len(X) < 100:
-            logging.warning(f"⚠️ Not enough samples to train {ticker}, skipping.")
+        if len(X_train) < 100:
+            logging.warning(
+                f"⚠️ Not enough samples to train {ticker}, skipping."
+            )
             continue
 
         model_path = MODEL_DIR / f"{ticker}_model.h5"
@@ -163,12 +168,14 @@ def retrain_job(force: bool = False):
             continue
 
         try:
-            model, _, _ = train_and_save_model(X, y, X.shape[1:], ticker)
+            model, _, _ = train_and_save_model(
+                X_train, y_train, X_train.shape[1:], ticker
+            )
             model.save(model_path)
             update_watchlist_timestamp(ticker, "last_trained")
             send(f"✅ {ticker}: Model retrained and saved.")
         except Exception as e:
-            logging.error(f"❌ Training error for {ticker}: {e}")
+            logging.error(f"❌ Error retraining {ticker}: {e}")
             send(f"❌ Error retraining {ticker}: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────

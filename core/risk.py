@@ -1,25 +1,49 @@
+import numpy as np
 
 def adjust_leverage_for_volatility(base_leverage: float, volatility: float, threshold: float = 0.02) -> float:
     """
-    Reduces leverage if volatility is higher than a safe threshold.
+    Smoothly reduces leverage if volatility exceeds a safe threshold.
+
+    Args:
+        base_leverage: initial leverage recommendation.
+        volatility: observed volatility (e.g. std of returns).
+        threshold: volatility threshold above which leverage reduces.
+
+    Returns:
+        Adjusted leverage as a float, not dropping below the minimum of 2.
     """
-    if volatility > threshold:
+    # If volatility is too high, scale leverage down proportionally
+    if volatility > threshold and volatility > 0:
         adjusted = base_leverage * (threshold / volatility)
-        return max(2, round(adjusted))
-    return base_leverage
+        # Ensure minimum leverage of 2
+        return float(max(2.0, adjusted))
+    # Otherwise keep original leverage
+    return float(base_leverage)
 
 
-def calculate_optimal_leverage(current_price: float, predicted_price: float, cert_type: str, knockout_buffer=0.10) -> int:
+def calculate_optimal_leverage(
+    current_price: float,
+    predicted_price: float,
+    cert_type: str,
+    knockout_buffer: float = 0.10
+) -> float:
     """
-    Determines leverage based on predicted movement and risk margin (knockout buffer).
+    Determines a smooth, continuous leverage recommendation based on predicted movement,
+    risk margin (knockout buffer), and desired risk-return ratio.
+
+    Uses a continuous clamp rather than snapping to discrete levels.
     """
-    pct_change = (predicted_price / current_price - 1) * 100
+    # Compute percentage change
+    pct_change = (predicted_price / current_price - 1) * 100.0
+    # If movement too small, return minimum leverage
     if abs(pct_change) < 0.01:
-        return 2  # Too small to justify leverage
+        return 2.0
 
-    candidate = round(50 / abs(pct_change))
-    candidate = min(40, max(2, candidate))
+    # Base candidate leverage (continuous), clamped between 2x and 40x
+    candidate = 50.0 / abs(pct_change)
+    candidate = float(np.clip(candidate, 2.0, 40.0))
 
+    # Compute risk margin parameters
     if cert_type == "Call":
         barrier = current_price * (1 - knockout_buffer)
         profit = predicted_price - current_price
@@ -29,23 +53,26 @@ def calculate_optimal_leverage(current_price: float, predicted_price: float, cer
         profit = current_price - predicted_price
         gap = barrier - current_price
     else:
+        # If not a Call/Put, just use candidate
         return candidate
 
-    risk_ratio = profit / gap if gap else 0
-    if risk_ratio < 1:
-        adjusted = 2
-    elif risk_ratio < 2:
-        adjusted = 2 + (risk_ratio - 1) * (candidate - 2)
+    # Risk ratio: reward per unit gap
+    risk_ratio = profit / gap if gap != 0 else 0.0
+
+    # Smooth adjustment: ramps from 2x at ratio=1 to candidate at ratio>=2
+    if risk_ratio <= 1.0:
+        adjusted = 2.0
+    elif risk_ratio < 2.0:
+        adjusted = float(np.interp(risk_ratio, [1.0, 2.0], [2.0, candidate]))
     else:
         adjusted = candidate
 
-    allowed_levels = [2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30, 40]
-    return min(allowed_levels, key=lambda x: abs(x - adjusted))
+    return adjusted
 
 
-def generate_certificate(current_price, predicted_price, volatility):
+def generate_certificate(current_price: float, predicted_price: float, volatility: float) -> str:
     """
-    Generates a human-readable recommendation for leverage product.
+    Generates a human-readable recommendation for a leverage product.
     """
     if predicted_price > current_price:
         cert_type = "Call"
@@ -58,18 +85,24 @@ def generate_certificate(current_price, predicted_price, volatility):
 
     base_leverage = calculate_optimal_leverage(current_price, predicted_price, cert_type)
     safe_leverage = adjust_leverage_for_volatility(base_leverage, volatility)
-    return f"{desc} with recommended leverage {safe_leverage}x"
+    return f"{desc} with recommended leverage {safe_leverage:.2f}x"
 
 
-def determine_trade_signal(predicted_pct_change, trend, rsi, volume, min_threshold=0.5):
+def determine_trade_signal(
+    predicted_pct_change: float,
+    trend: str,
+    rsi: float,
+    volume: float,
+    min_threshold: float = 0.5
+) -> tuple[str, float]:
     """
-    Returns a simple trade recommendation based on predicted price move, trend, and RSI.
+    Returns a simple trade recommendation based on predicted move, trend, and RSI.
     """
     abs_change = abs(predicted_pct_change)
     if abs_change < min_threshold:
-        return "No Trade", 0
+        return "No Trade", 0.0
 
-    confidence = min(100, abs_change * 10)
+    confidence = float(min(100.0, abs_change * 10.0))
     if predicted_pct_change > 0 and trend == "Bullish" and rsi < 70:
         return "Buy", confidence
     elif predicted_pct_change < 0 and trend == "Bearish" and rsi > 30:
@@ -78,10 +111,15 @@ def determine_trade_signal(predicted_pct_change, trend, rsi, volume, min_thresho
         return "No Trade", confidence
 
 
-def determine_position_size(account_balance, risk_per_trade, volatility):
+def determine_position_size(
+    account_balance: float,
+    risk_per_trade: float,
+    volatility: float
+) -> float:
     """
     Computes a position size based on risk exposure and volatility.
     """
     base = account_balance * risk_per_trade
+    # Avoid division by zero
     safe_vol = max(volatility, 0.01)
-    return base / safe_vol
+    return float(base / safe_vol)
