@@ -1,4 +1,3 @@
-# storage.py
 import sqlite3, json
 from pathlib import Path
 from datetime import datetime
@@ -71,7 +70,7 @@ def save_evaluation(row: dict):
 
 def get_recent_errors(n: int) -> List[float]:
     """
-    Return the last `n` pct_error values from the evaluation table, ordered by date descending.
+    Return the last `n` pct_error values from the evaluation table, ordered desc.
     """
     with _conn() as c:
         rows = c.execute(

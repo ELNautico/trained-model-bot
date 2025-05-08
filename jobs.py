@@ -15,10 +15,12 @@ from storage import (
     DB,
     get_watchlist,
     update_watchlist_timestamp,
+    get_recent_errors,
 )
 from alert import send
 from train.pipeline import train_predict_for_ticker, prepare_data_and_split, download_data
-from train.core import train_and_save_model
+from train.core import train_and_save_model, load_model
+from tensorflow.keras.optimizers import Adam
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -28,6 +30,7 @@ MODEL_TAG = "v2025Q2"
 ACCT_BAL = 100_000
 RISK = 0.01
 MODEL_DIR = pathlib.Path("models")
+ERROR_THRESHOLD = 2.0  # Only fine-tune if avg pct_error over recent days ≥ 2%
 
 CALENDARS = {
     "SPX": "NYSE",
@@ -47,6 +50,7 @@ def is_trading_day_all() -> bool:
     return True
 
 # ─────────────────────────────────────────────────────────────────────────────
+
 def forecast_job():
     if not is_trading_day_all():
         logging.info("Market closed today – skipping forecast job.")
@@ -96,6 +100,7 @@ def forecast_job():
             send(f"❌ {ticker}: Forecast failed – {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+
 def evaluate_job():
     if not is_trading_day_all():
         logging.info("Market closed today – skipping evaluation job.")
@@ -148,35 +153,65 @@ def retrain_job(force: bool = False):
     MODEL_DIR.mkdir(exist_ok=True)
     for ticker in get_watchlist():
         logging.info(f"🔄 Retraining model for {ticker}")
+
+        # 1) Load or prepare data
         try:
             df = download_data(ticker)
-            # Only unpack training sequences
             X_train, y_train, *_ = prepare_data_and_split(df, window_size=60)
         except Exception as e:
-            logging.error(f"❌ Failed to prepare data for {ticker}: {e}")
+            logging.error(f"❌ Data prep failed for {ticker}: {e}")
             continue
 
         if len(X_train) < 100:
-            logging.warning(
-                f"⚠️ Not enough samples to train {ticker}, skipping."
-            )
+            logging.warning(f"⚠️ Not enough samples for {ticker}, skipping.")
             continue
+
+        # 2) Conditional skip based on recent error
+        if not force:
+            recent = get_recent_errors(5)
+            avg_err = sum(recent) / len(recent) if recent else 0.0
+            if avg_err < ERROR_THRESHOLD:
+                logging.info(f"{ticker}: avg error {avg_err:.2f}% < threshold {ERROR_THRESHOLD}% → skipping retrain.")
+                continue
 
         model_path = MODEL_DIR / f"{ticker}_model.h5"
-        if model_path.exists() and not force:
-            logging.info(f"✔️ Model for {ticker} already exists. Skipping.")
-            continue
 
-        try:
+        # 3) Full retrain if missing or forced
+        if not model_path.exists() or force:
             model, _, _ = train_and_save_model(
                 X_train, y_train, X_train.shape[1:], ticker
             )
             model.save(model_path)
             update_watchlist_timestamp(ticker, "last_trained")
-            send(f"✅ {ticker}: Model retrained and saved.")
+            send(f"✅ {ticker}: Full retrain complete.")
+            continue
+
+        # 4) Otherwise fine-tune existing model
+        try:
+            model = load_model(ticker)
+            logging.info(f"✏️ Fine-tuning existing model for {ticker}")
+
+            # Compile with a lower LR
+            model.compile(
+                optimizer=Adam(learning_rate=1e-5),
+                loss=model.loss,
+                metrics=model.metrics
+            )
+
+            history = model.fit(
+                X_train, y_train,
+                epochs=5,
+                validation_split=0.1,
+                verbose=1
+            )
+
+            model.save(model_path)
+            update_watchlist_timestamp(ticker, "last_trained")
+            send(f"✅ {ticker}: Fine-tune complete ({len(history.history['loss'])} epochs).")
         except Exception as e:
-            logging.error(f"❌ Error retraining {ticker}: {e}")
-            send(f"❌ Error retraining {ticker}: {e}")
+            logging.error(f"❌ Fine-tune failed for {ticker}: {e}")
+            send(f"❌ Fine-tune failed for {ticker}: {e}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def help_job():
