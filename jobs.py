@@ -1,10 +1,9 @@
-# jobs.py
-
 import logging
 import sqlite3
 import time
 import pathlib
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
 
@@ -50,7 +49,6 @@ def is_trading_day_all() -> bool:
     return True
 
 # ─────────────────────────────────────────────────────────────────────────────
-
 def forecast_job():
     if not is_trading_day_all():
         logging.info("Market closed today – skipping forecast job.")
@@ -58,49 +56,63 @@ def forecast_job():
         return
 
     for ticker in get_watchlist():
-        time.sleep(3)
+        time.sleep(10)
+
+        # 1) Notify if no versioned model exists
+        version_dir = MODEL_DIR / ticker
+        if not (version_dir.exists() and any(version_dir.iterdir())):
+            send(f"🛠️ No model found for {ticker}. Training a new one now…")
+
         try:
+            # 2) Run pipeline (it will load or train as needed)
             result, _ = train_predict_for_ticker(
                 ticker,
                 use_ensemble=True,
                 account_balance=ACCT_BAL,
                 risk_per_trade=RISK,
             )
-            res = {
-                "Current Price": result["Current Price"],
-                "Predicted Price": result["Predicted Price"],
-                "Predicted % Change": result["Predicted % Change"],
-                "Confidence": result["Confidence"],
-            }
 
-            direction = (
-                "Buy" if res["Predicted % Change"] > 0
-                else "Sell" if res["Predicted % Change"] < 0
-                else "Hold"
-            )
+            current   = result["Current Price"]
+            predicted = result["Predicted Price"]
+            conf      = result["Confidence"]
+            pct_chg   = result["Predicted % Change"]
 
-            row = dict(
-                ts=datetime.utcnow().date().isoformat(),
-                ticker=ticker,
-                current_px=res["Current Price"],
-                predicted_px=res["Predicted Price"],
-                direction=direction,
-                confidence=res["Confidence"],
-                model_tag=MODEL_TAG,
-            )
-            save_forecast(row)
+            # 3) Compute recommendation
+            direction = "Buy" if pct_chg > 0 else "Sell" if pct_chg < 0 else "Hold"
+
+            # 4) Persist forecast
+            save_forecast({
+                "ts": datetime.utcnow().date().isoformat(),
+                "ticker": ticker,
+                "current_px": current,
+                "predicted_px": predicted,
+                "direction": direction,
+                "confidence": conf,
+                "model_tag": MODEL_TAG,
+            })
             update_watchlist_timestamp(ticker, "last_forecast")
-            send(
-                f"📈 {ticker}: {direction}\n"
-                f"Predicted Close: {res['Predicted Price']:.2f} "
-                f"(conf {res['Confidence']:.1f}%)"
+
+            # 5) Local‐time formatting
+            now   = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")) \
+                                      .astimezone(ZoneInfo("Europe/Vienna"))
+            ts_str = now.strftime("%d.%m at %H:%M")
+
+            # 6) Send final message
+            msg = (
+                f"📈 Stock: {ticker}\n"
+                f"📊 Prediction on {ts_str}\n"
+                f"📋 Current Price: {current:.2f}\n"
+                f"🧠 Predicted Close: {predicted:.2f} ({conf:.1f}%)\n\n"
+                f"⚠️ ️Recommendation:\n"
+                f"{direction}"
             )
+            send(msg)
+
         except Exception as e:
             logging.error(f"{ticker}: Forecast failed – {e}")
             send(f"❌ {ticker}: Forecast failed – {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-
 def evaluate_job():
     if not is_trading_day_all():
         logging.info("Market closed today – skipping evaluation job.")
@@ -125,17 +137,15 @@ def evaluate_job():
             error = actual_close - predicted_px
             pct_error = (error / actual_close) * 100
 
-            eval_row = dict(
-                ts=today,
-                ticker=tkr,
-                predicted_px=predicted_px,
-                actual_px=actual_close,
-                error=error,
-                pct_error=pct_error,
-                model_tag=model_tag,
-            )
-            save_evaluation(eval_row)
-
+            save_evaluation({
+                "ts": today,
+                "ticker": tkr,
+                "predicted_px": predicted_px,
+                "actual_px": actual_close,
+                "error": error,
+                "pct_error": pct_error,
+                "model_tag": model_tag,
+            })
             send(
                 f"✅ {tkr} Evaluation:\n"
                 f"Predicted: {predicted_px:.2f}, Actual: {actual_close:.2f}\n"
@@ -154,7 +164,7 @@ def retrain_job(force: bool = False):
     for ticker in get_watchlist():
         logging.info(f"🔄 Retraining model for {ticker}")
 
-        # 1) Load or prepare data
+        # 1) Prepare data
         try:
             df = download_data(ticker)
             X_train, y_train, *_ = prepare_data_and_split(df, window_size=60)
@@ -166,17 +176,19 @@ def retrain_job(force: bool = False):
             logging.warning(f"⚠️ Not enough samples for {ticker}, skipping.")
             continue
 
-        # 2) Conditional skip based on recent error
+        # 2) Error‐based skip
         if not force:
             recent = get_recent_errors(5)
-            avg_err = sum(recent) / len(recent) if recent else 0.0
+            avg_err = (sum(recent)/len(recent)) if recent else 0.0
             if avg_err < ERROR_THRESHOLD:
-                logging.info(f"{ticker}: avg error {avg_err:.2f}% < threshold {ERROR_THRESHOLD}% → skipping retrain.")
+                logging.info(
+                    f"{ticker}: avg error {avg_err:.2f}% < threshold {ERROR_THRESHOLD}% → skipping retrain."
+                )
                 continue
 
         model_path = MODEL_DIR / f"{ticker}_model.h5"
 
-        # 3) Full retrain if missing or forced
+        # 3) Full retrain
         if not model_path.exists() or force:
             model, _, _ = train_and_save_model(
                 X_train, y_train, X_train.shape[1:], ticker
@@ -186,32 +198,27 @@ def retrain_job(force: bool = False):
             send(f"✅ {ticker}: Full retrain complete.")
             continue
 
-        # 4) Otherwise fine-tune existing model
+        # 4) Fine‐tune
         try:
             model = load_model(ticker)
             logging.info(f"✏️ Fine-tuning existing model for {ticker}")
-
-            # Compile with a lower LR
             model.compile(
                 optimizer=Adam(learning_rate=1e-5),
                 loss=model.loss,
                 metrics=model.metrics
             )
-
             history = model.fit(
                 X_train, y_train,
                 epochs=5,
                 validation_split=0.1,
                 verbose=1
             )
-
             model.save(model_path)
             update_watchlist_timestamp(ticker, "last_trained")
             send(f"✅ {ticker}: Fine-tune complete ({len(history.history['loss'])} epochs).")
         except Exception as e:
             logging.error(f"❌ Fine-tune failed for {ticker}: {e}")
             send(f"❌ Fine-tune failed for {ticker}: {e}")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 def help_job():
@@ -220,12 +227,11 @@ def help_job():
         "📈 /forecast – Run model and send today's market predictions.\n\n"
         "📊 /evaluate – Compare today's forecasts to actual prices.\n\n"
         "🔄 /retrain – Retrain models only if missing.\n\n"
-        "⚠️ /retrain_force – Force retraining of all models, even if already trained.\n\n"
-        "📥 /add TICKER – Add a stock ticker to your watchlist (e.g. `/add AAPL`).\n\n"
+        "⚠️ /retrain_force – Force retraining of all models, even if trained.\n\n"
+        "📥 /add TICKER – Add a stock ticker to your watchlist.\n\n"
         "🗑️ /remove TICKER – Remove a stock from your watchlist.\n\n"
-        "📋 /watchlist – Show all currently watched tickers.\n\n"
-        "❓ /help – Show this list of available commands.\n\n"
-        "📅 *Note:* All times are UTC and forecasts are stored in the database."
+        "📋 /watchlist – Show your current watchlist.\n\n"
+        "❓ /help – Show this message."
     )
     send(help_text)
 

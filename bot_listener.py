@@ -1,8 +1,8 @@
-# bot_listener.py
-
 import logging
 import asyncio
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import toml
 from telegram import Update
@@ -48,22 +48,39 @@ async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await msg.edit_text("📭 Your watchlist is empty. Add tickers with /add.")
 
     for ticker in tickers:
+        version_dir = Path("models") / ticker
+        if not version_dir.exists() or not any(version_dir.iterdir()):
+            await msg.reply_text(f"🛠️ No model found for {ticker}. Training a new one now…")
+
         try:
-            results, _ = await asyncio.to_thread(
+            result, _ = await asyncio.to_thread(
                 train_predict_for_ticker,
                 ticker, True, 100_000, 0.01
             )
+
+            current   = result["Current Price"]
+            predicted = result["Predicted Price"]
+            conf      = result["Confidence"]
+            pct_chg   = result["Predicted % Change"]
+
+            direction = "Buy" if pct_chg > 0 else "Sell" if pct_chg < 0 else "Hold"
+
+            now   = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")) \
+                                     .astimezone(ZoneInfo("Europe/Vienna"))
+            ts_str = now.strftime("%d.%m at %H:%M")
+
             text = (
-                f"📈 {ticker}: {results['Timestamp']}\n\n"
-                f"Current: {results['Current Price']}\n "
-                f"Predicted: {results['Predicted Price']} "
-                f"({results['Predicted % Change']}%)\n\n"
-                f"Signal: {results['Recommended Certificate']}"
+                f"Prediction on {ts_str}\n"
+                f"Current Price: {current:.2f}\n"
+                f"Predicted Close: {predicted:.2f} ({conf:.1f}%)\n\n"
+                f"Recommendation:\n"
+                f"{direction}"
             )
             await msg.reply_text(text)
+
         except Exception as e:
             logging.error("Forecast failed for %s: %s", ticker, e)
-            await msg.reply_text(f"❌ Forecast failed for {ticker}: {e}")
+            await msg.reply_text(f"❌ {ticker}: Forecast failed – {e}")
 
 @restricted
 async def evaluate(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -10,6 +10,9 @@ import toml
 from sklearn.preprocessing import MinMaxScaler
 from twelvedata import TDClient
 import joblib
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+import requests
+
 
 from core.features import enrich_features, get_feature_columns
 from core.sensitivity import compute_feature_sensitivity
@@ -38,7 +41,11 @@ MAX_STALE_DAYS = 2
 # DATA HANDLING
 # ─────────────────────────────────────────────────────────────────────────────
 
-
+@retry(
+    retry=retry_if_exception_type(requests.exceptions.RequestException),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    stop=stop_after_attempt(3),
+)
 def _download_and_cache(ticker: str, path: Path) -> pd.DataFrame:
     """
     Internal helper: download, normalize, cache, return DataFrame.
