@@ -13,3 +13,5 @@ bot.db
 # IDE
 .vscode/
 tuning_logs/
+.idea/
+./logs/training

@@ -20,6 +20,8 @@ from alert import send
 from train.pipeline import train_predict_for_ticker, prepare_data_and_split, download_data
 from train.core import train_and_save_model, load_model
 from tensorflow.keras.optimizers import Adam
+from mlops.monitor import drift_job
+import tensorflow as tf
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -158,6 +160,10 @@ def evaluate_job():
             logging.error(f"❌ Evaluation failed for {tkr}: {e}")
             send(f"❌ Evaluation failed for {tkr}: {e}")
 
+    # Run drift detection after evaluation
+    logging.info("🔎 Running drift detection after evaluation job...")
+    drift_job()
+
 # ─────────────────────────────────────────────────────────────────────────────
 def retrain_job(force: bool = False):
     MODEL_DIR.mkdir(exist_ok=True)
@@ -202,6 +208,14 @@ def retrain_job(force: bool = False):
         try:
             model = load_model(ticker)
             logging.info(f"✏️ Fine-tuning existing model for {ticker}")
+            if not model.loss:  # legacy model saved w/ compile=False
+                model.compile(
+                    optimizer="adam",
+                    loss={"d1": tf.keras.losses.MeanSquaredError(),
+                          "d5": tf.keras.losses.MeanSquaredError()},
+                    metrics={"d1": [tf.keras.metrics.MeanAbsoluteError()],
+                             "d5": [tf.keras.metrics.MeanAbsoluteError()]},
+                )
             model.compile(
                 optimizer=Adam(learning_rate=1e-5),
                 loss=model.loss,
@@ -228,6 +242,7 @@ def help_job():
         "📊 /evaluate – Compare today's forecasts to actual prices.\n\n"
         "🔄 /retrain – Retrain models only if missing.\n\n"
         "⚠️ /retrain_force – Force retraining of all models, even if trained.\n\n"
+        "🚨 /drift – Run drift-detection; retrains only models that show data drift.\n\n"
         "📥 /add TICKER – Add a stock ticker to your watchlist.\n\n"
         "🗑️ /remove TICKER – Remove a stock from your watchlist.\n\n"
         "📋 /watchlist – Show your current watchlist.\n\n"
@@ -251,6 +266,8 @@ def _cli():
         retrain_job(force=True)
     elif job == "help":
         help_job()
+    elif job == "drift":
+        drift_job()
     else:
         print("Usage: jobs.py [forecast|evaluate|retrain|retrain_force|help]")
 

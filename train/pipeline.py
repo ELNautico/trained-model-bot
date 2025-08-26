@@ -1,262 +1,285 @@
-import logging
+"""
+train/pipeline.py
+End-to-end pipeline with automatic *feature pruning*.
+
+Flow
+----
+1. Download & cache OHLCV
+2. Feature-engineer full set
+3. If a pruned-feature file exists → use it
+4. Hyper-parameter tuning (walk-forward, via transformer_utils)
+5. Sensitivity analysis → drop weakest P% features
+6. Retrain ensemble on pruned features
+7. Forecast price & σ̂ and forward them to risk module
+"""
+from __future__ import annotations
+from core.features import enrich_features, get_feature_columns
+
 import hashlib
+import json
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import joblib
 import numpy as np
 import pandas as pd
 import toml
 from sklearn.preprocessing import MinMaxScaler
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 from twelvedata import TDClient
-import joblib
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
-import requests
-
 
 from core.features import enrich_features, get_feature_columns
-from core.sensitivity import compute_feature_sensitivity
 from core.risk import generate_certificate
-from core.utils import directional_accuracy
-from train.core import train_and_save_model, load_model, predict_price
+from core.sensitivity import compute_feature_sensitivity
+from train.core import load_model, predict_price, train_and_save_model
 from train.evaluate import backtest_strategy
-from storage import save_forecast, save_evaluation
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-config_path = Path(__file__).resolve().parent.parent / "config.toml"
-api_key = toml.load(config_path)["twelvedata"]["api_key"]
-
+_cfg_path = Path(__file__).resolve().parent.parent / "config.toml"
+api_key = toml.load(_cfg_path)["twelvedata"]["api_key"]
 td = TDClient(apikey=api_key)
+
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# Cache settings
 CACHE_TTL = timedelta(hours=24)
-MAX_RETURN_THRESHOLD = 0.1   # 10% daily return
+MAX_RETURN_THRESHOLD = 0.10
 MAX_STALE_DAYS = 2
+PRUNE_PCT = 30                      # bottom X % features to drop
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA HANDLING
+#  Helpers ­– I/O
 # ─────────────────────────────────────────────────────────────────────────────
+def _pruned_path(ticker: str) -> Path:
+    """models/TKR/LATEST_pruned_features.json"""
+    return Path("models") / ticker / "LATEST_pruned_features.json"
 
+
+def load_pruned_features(ticker: str) -> list[str] | None:
+    path = _pruned_path(ticker)
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            logging.warning("⚠️  Failed to read pruned-feature list for %s", ticker)
+    return None
+
+
+def save_pruned_features(ticker: str, pruned: list[str], version_dir: Path):
+    latest = _pruned_path(ticker)
+    try:
+        latest.write_text(json.dumps(pruned, indent=2))
+        (version_dir / "pruned_features.json").write_text(json.dumps(pruned, indent=2))
+    except Exception as e:
+        logging.warning("⚠️  Could not persist pruned features: %s", e)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Raw data download + clean
+# ─────────────────────────────────────────────────────────────────────────────
 @retry(
-    retry=retry_if_exception_type(requests.exceptions.RequestException),
+    retry=retry_if_exception_type(Exception),
     wait=wait_exponential(multiplier=1, min=1, max=10),
     stop=stop_after_attempt(3),
 )
-def _download_and_cache(ticker: str, path: Path) -> pd.DataFrame:
-    """
-    Internal helper: download, normalize, cache, return DataFrame.
-    """
-    df = td.time_series(
-        symbol=ticker,
-        interval="1day",
-        outputsize=5000,
-        timezone="UTC"
-    ).as_pandas()
-
+def _download_raw_ohlcv(ticker: str) -> pd.DataFrame:
+    df = td.time_series(symbol=ticker, interval="1day",
+                        outputsize=5000, timezone="UTC").as_pandas()
     if df.empty:
-        raise ValueError(f"Downloaded data for {ticker} is empty.")
-
-    # Standardize column names
-    df.columns = [col.strip().lower() for col in df.columns]
-    df.rename(columns={
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "volume": "Volume"
-    }, inplace=True)
-
-    required = {"Open", "High", "Low", "Close", "Volume"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing expected columns: {missing}")
-
-    df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-    logging.info(f"✅ Downloaded and normalized data for {ticker}")
-
-    joblib.dump(df, path)
-    return df
+        raise ValueError(f"Empty OHLCV for {ticker}")
+    df.columns = [c.capitalize() for c in df.columns]
+    df.index = pd.to_datetime(df.index, utc=True)
+    return df.sort_index()
 
 
 def cached_download(ticker: str) -> pd.DataFrame:
-    """
-    Downloads OHLCV data, caching to disk with a 24h TTL. Also removes outliers and stale rows.
-    """
     key = hashlib.md5(ticker.encode()).hexdigest()
     path = CACHE_DIR / f"{key}.pkl"
 
-    # Load from cache if fresh
-    if path.exists():
-        mtime = datetime.utcfromtimestamp(path.stat().st_mtime)
-        if datetime.utcnow() - mtime < CACHE_TTL:
-            logging.info(f"📦 Loaded cached data for {ticker}")
-            df = joblib.load(path)
-        else:
-            logging.info(f"🕑 Cache expired for {ticker}, re-downloading...")
-            df = _download_and_cache(ticker, path)
+    if path.exists() and datetime.utcnow() - datetime.utcfromtimestamp(path.stat().st_mtime) < CACHE_TTL:
+        df = joblib.load(path)
     else:
-        df = _download_and_cache(ticker, path)
+        df = _download_raw_ohlcv(ticker)
+        joblib.dump(df, path)
 
-    # Outlier detection: drop extreme returns
-    df['return'] = df['Close'].pct_change()
-    outliers = df['return'].abs() > MAX_RETURN_THRESHOLD
-    if outliers.any():
-        logging.warning(f"⚠️ Dropping {outliers.sum()} outlier rows for {ticker}")
-        df = df.loc[~outliers]
+    df["ret"] = df["Close"].pct_change()
+    df = df.loc[df["ret"].abs() <= MAX_RETURN_THRESHOLD].drop(columns="ret")
 
-    # Staleness detection: drop gaps > MAX_STALE_DAYS
-    gaps = df.index.to_series().diff()
-    stale = gaps > pd.Timedelta(days=MAX_STALE_DAYS)
-    if stale.any():
-        logging.warning(f"⚠️ Dropping {stale.sum()} stale rows for {ticker}")
-        df = df.loc[~stale]
-
-    df.drop(columns=['return'], inplace=True)
+    gaps = df.index.to_series().diff() > pd.Timedelta(days=MAX_STALE_DAYS)
+    if gaps.any():
+        df = df.loc[~gaps]
     return df
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Sequence builder (d1 & d5 only)         << UPDATED
+# ─────────────────────────────────────────────────────────────────────────────
+def build_sequences(
+    df: pd.DataFrame,
+    feats: list[str],
+    *,
+    window_size: int,
+    test_ratio: float = 0.2,
+):
+    close = df["Close"].values
 
-def prepare_data_and_split(df: pd.DataFrame, window_size: int = 60, test_ratio: float = 0.2):
-    """
-    Enrich features, apply caching outlier/stale-cleaned data,
-    then scale inputs+target with a single MinMaxScaler for stability.
+    df = df[feats].ffill().bfill()
 
-    Returns:
-        X_train, y_train, X_test, y_test, scaler, train_size
-    """
-    # Feature engineering
-    df = enrich_features(df)
+    split = int(len(df) * (1 - test_ratio))
+    train_df, test_df = df.iloc[:split], df.iloc[split:]
 
-    # Subset and clean
-    feature_cols = get_feature_columns()
-    df = df[feature_cols].copy().ffill().bfill().dropna()
-
-    if len(df) < window_size + 5:
-        raise ValueError(
-            f"Not enough data to build sequences. Got only {len(df)} rows after cleaning."
-        )
-
-    # Train/test split
-    split_idx = int(len(df) * (1 - test_ratio))
-    train_df = df.iloc[:split_idx]
-    test_df = df.iloc[split_idx:]
-
-    # Scale both features+target
     scaler = MinMaxScaler()
-    scaler.fit(train_df)
-    train_scaled = scaler.transform(train_df)
-    test_scaled = scaler.transform(test_df)
+    train_sc = scaler.fit_transform(train_df)
+    test_sc  = scaler.transform(test_df)
+    sc_all   = np.vstack([train_sc, test_sc])
 
-    # Identify target column index
-    target_idx = feature_cols.index('Close')
+    X_tr, X_te = [], []
+    y1_tr, y5_tr = [], []
+    y1_te, y5_te = [], []
 
-    # Build sequences for X and y (scaled target)
-    def build_sequences(scaled_array):
-        X, y = [], []
-        for i in range(window_size, len(scaled_array)):
-            X.append(scaled_array[i - window_size:i])
-            y.append(scaled_array[i][target_idx])
-        return np.array(X), np.array(y)
+    last_idx = len(df) - 5
 
-    X_train, y_train = build_sequences(train_scaled)
-    X_test, y_test = build_sequences(test_scaled)
+    def _append(X, y1, y5, i):
+        X.append(sc_all[i - window_size : i])
+        y1.append(np.log(close[i] / close[i - 1]))        # 1-day return
+        y5.append(np.log(close[i + 4] / close[i - 1]))    # 5-day return
 
-    if len(X_train) == 0 or len(X_test) == 0:
-        raise ValueError(
-            "Train/Test sequences are empty. Check window size or data size."
-        )
+    for i in range(window_size, split - 5):
+        _append(X_tr, y1_tr, y5_tr, i)
+    for i in range(split, last_idx):
+        _append(X_te, y1_te, y5_te, i)
 
-    return X_train, y_train, X_test, y_test, scaler, len(X_train)
+    y_train = {"d1": np.array(y1_tr), "d5": np.array(y5_tr)}
+    y_test  = {"d1": np.array(y1_te), "d5": np.array(y5_te)}
+
+    return (
+        np.array(X_tr),
+        y_train,
+        np.array(X_te),
+        y_test,
+        scaler,
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PIPELINE
+#  Main orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
-
-def train_predict_for_ticker(ticker, use_ensemble=True, account_balance=100_000, risk_per_trade=0.01):
-    logging.info(f"🚀 Starting full pipeline for {ticker}")
+def train_predict_for_ticker(
+    ticker: str,
+    use_ensemble: bool = True,      # ← works both positionally *and* as keyword
+    account_balance: float = 100_000.0,
+    risk_per_trade: float = 0.01,
+):
+    logging.info("🚀 %s – pipeline start", ticker)
     df = cached_download(ticker)
 
-    if len(df) < 100:
-        raise ValueError(f"Not enough data for {ticker}. Only {len(df)} rows downloaded.")
+    df = enrich_features(df)
 
-    window_size = 60 if len(df) >= 600 else 30
-    X_train, y_train, X_test, y_test, scaler, train_size = prepare_data_and_split(df, window_size)
+    # ── feature subset (may be pruned)
+    all_feats = get_feature_columns()
+    pruned = load_pruned_features(ticker)
+    feats_in_use = [f for f in all_feats if f not in (pruned or [])]
 
+    win = 60 if len(df) >= 600 else 30
+    X_tr, y_tr, X_te, y_te, scaler = build_sequences(df, feats_in_use, window_size=win)
+
+    # ── model load / train
     try:
         model = load_model(ticker)
-        logging.info("📦 Loaded existing model.")
+        logging.info("📦 model loaded")
     except FileNotFoundError:
-        logging.info("🛠️ No saved model found. Training from scratch...")
-        model, _, _ = train_and_save_model(X_train, y_train, X_train.shape[1:], ticker)
+        logging.info("🛠️ training from scratch (full feature set)")
+        model, _, best_hp = train_and_save_model(X_tr, y_tr, X_tr.shape[1:], ticker)
 
-    last_seq = X_test[-1:]
-    pred_price = predict_price(model, last_seq, scaler)
-    current_price = float(df['Close'].iloc[-1])
-    ensemble_pred = 0.9 * pred_price + 0.1 * current_price if use_ensemble else pred_price
+    # ── sensitivity → prune bottom PRUNE_PCT %
+    if pruned is None:
+        last_seq_full = X_te[-1:][...]
+        sens = compute_feature_sensitivity(model, last_seq_full, feats_in_use)
+        thresh = np.percentile(list(sens.values()), PRUNE_PCT)
+        weak = [f for f, v in sens.items() if v <= thresh]
 
-    hist_vol = float(df['Close'].pct_change().std())
-    clamp = min(hist_vol * 2, 0.05)
-    pmin, pmax = current_price * (1 - clamp), current_price * (1 + clamp)
-    final_price = float(np.clip(ensemble_pred, pmin, pmax))
+        if weak and len(weak) < len(all_feats) * 0.5:   # keep at least 50 %
+            logging.info("✂️  Pruning %d weak features: %s", len(weak), weak)
+            # rebuild sequences WITHOUT the weak features
+            feats_pruned = [f for f in feats_in_use if f not in weak]
+            X_tr_p, y_tr_p, X_te_p, y_te_p, _ = build_sequences(
+                df, feats_pruned, window_size=win
+            )
+            # reuse same HPs → fast retrain
+            model, _, _ = train_and_save_model(X_tr_p, y_tr_p,
+                                               X_tr_p.shape[1:], ticker)
+            version_dir = Path("models") / ticker / sorted(
+                (Path("models") / ticker).iterdir(), reverse=True
+            )[0].name
+            save_pruned_features(ticker, weak, version_dir)
+            feats_in_use = feats_pruned
+            X_te = X_te_p  # update inference seq
 
-    acc, cum_ret = backtest_strategy(model, X_test, scaler, df, window_size)
+    # ── forecast
+    current_px = float(df["Close"].iloc[-1])
+    last_seq = X_te[-1:][...]
+    pred_px, pred_vol = predict_price(model, last_seq, current_px)
+    final_px = 0.9 * pred_px + 0.1 * current_px if use_ensemble else pred_px
 
-    ts = df.index[-1]
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=ZoneInfo("UTC"))
-    ts = ts.astimezone(ZoneInfo("Europe/Vienna"))
+    hist_vol = float(df["Close"].pct_change().std())
+    vol_used = float(np.clip(pred_vol, 0.5 * hist_vol, 2.0 * hist_vol))
 
-    pct_change = (final_price / current_price - 1) * 100
+    pct_change = (final_px / current_px - 1) * 100
     confidence = round(min(abs(pct_change) * 10, 100), 1)
     direction = "Buy" if pct_change > 0 else "Sell" if pct_change < 0 else "Hold"
-    cert = generate_certificate(current_price, final_price, hist_vol)
-    sensitivity = compute_feature_sensitivity(model, last_seq, get_feature_columns())
+    acc, cum_ret = backtest_strategy(model, X_te, df, win)
 
-    try:
-        save_forecast({
-            "ts": datetime.utcnow().strftime("%Y-%m-%d"),
-            "ticker": ticker,
-            "current_px": current_price,
-            "predicted_px": final_price,
-            "direction": direction,
-            "confidence": confidence,
-            "model_tag": "v2025Q2"
-        })
-        logging.info("📩 Saved forecast to DB.")
-    except Exception as e:
-        logging.warning(f"⚠️ Failed to save forecast: {e}")
+    ts_local = df.index[-1].tz_convert(ZoneInfo("Europe/Vienna"))
+    cert = generate_certificate(current_px, final_px, vol_used)
+    sens_out = compute_feature_sensitivity(model, last_seq, feats_in_use)
 
-    try:
-        save_evaluation({
-            "ts": datetime.utcnow().strftime("%Y-%m-%d"),
-            "ticker": ticker,
-            "predicted_px": final_price,
-            "actual_px": current_price,
-            "error": final_price - current_price,
-            "pct_error": abs(final_price - current_price) / current_price * 100,
-            "model_tag": "v2025Q2"
-        })
-        logging.info("📊 Saved evaluation to DB.")
-    except Exception as e:
-        logging.warning(f"⚠️ Failed to save evaluation: {e}")
+    return (
+        {
+            "Ticker": ticker,
+            "Timestamp": ts_local.strftime("%Y-%m-%d %H:%M %Z"),
+            "Current Price": round(current_px, 2),
+            "Predicted Price": round(final_px, 2),
+            "Predicted % Change": round(pct_change, 2),
+            "Confidence": confidence,
+            "Volatility": round(vol_used, 4),
+            "Directional Accuracy": round(acc, 4),
+            "Cumulative Return": round(cum_ret, 4),
+            "Recommended Certificate": cert,
+            "Feature Sensitivity": sens_out,
+            "Feature Count": len(feats_in_use),
+        },
+        df,
+    )
 
-    return {
-        "Ticker": ticker,
-        "Timestamp": ts.strftime('%Y-%m-%d %H:%M %Z'),
-        "Current Price": round(current_price, 2),
-        "Predicted Price": round(final_price, 2),
-        "Predicted % Change": round(pct_change, 2),
-        "Confidence": confidence,
-        "Volatility": round(hist_vol, 4),
-        "Directional Accuracy": round(acc, 4),
-        "Cumulative Return": round(cum_ret, 4),
-        "Recommended Certificate": cert,
-        "Feature Sensitivity": sensitivity
-    }, df
+# --------------------------------------------------------------------------
+# Back-compat aliases (used by jobs.py  and Telegram-Bot)
+# --------------------------------------------------------------------------
 
-# Alias to support jobs.py imports
+def prepare_data_and_split(
+    df: pd.DataFrame,
+    *,
+    window_size: int = 60,
+    test_ratio: float = 0.2,
+):
+    """
+    Legacy-Wrapper für alten Code (retrain, Bot).
+    Rechnet Features, ruft build_sequences() und liefert
+    dieselbe 6-teilige Tuple-Struktur wie früher zurück.
+    """
+    df = enrich_features(df)
+
+    feats = [f for f in get_feature_columns() if f in df.columns]
+    X_tr, y_tr, X_te, y_te, scaler = build_sequences(
+        df,
+        feats,
+        window_size=window_size,
+        test_ratio=test_ratio,
+    )
+    train_size = len(X_tr)
+    return X_tr, y_tr, X_te, y_te, scaler, train_size
+
+
+# keep old alias
 download_data = cached_download

@@ -1,55 +1,55 @@
+# core/lstm_utils.py
+"""
+Legacy helpers required by core/build.py
+────────────────────────────────────────
+    • estimate_huber_delta(y_train)
+    • build_lstm_model(hp, input_shape, huber_delta)
+
+They implement a single-output LSTM forecaster (next-day log-return).
+Nothing in the Transformer pipeline imports this file.
+"""
+
+from __future__ import annotations
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import Sequential, layers, optimizers, losses
+from tensorflow.keras import layers, losses, optimizers
+import keras_tuner as kt
 
 
+# ── robust δ for Huber loss ────────────────────────────────────────────────
 def estimate_huber_delta(y_train: np.ndarray) -> float:
-    """
-    Estimate a robust delta for the Huber loss function
-    based on the distribution of training targets.
-    """
-    # median absolute deviation
     med = np.median(y_train)
     mad = np.median(np.abs(y_train - med))
-    return 5 * mad
+    return float(5.0 * mad if mad > 0 else 1e-3)   # fallback if MAD==0
 
 
-def build_lstm_model(hp, input_shape, huber_delta=None):
-    """
-    Build a compiled LSTM model parameterized by a KerasTuner HyperParameters object.
-    Hyperparameter names:
-      - units            : number of LSTM units in first layer
-      - dropout_rate     : dropout rate after each LSTM
-      - use_second_lstm  : whether to add a second LSTM layer
-      - units2           : if second LSTM, its units
-      - learning_rate    : Adam learning rate (log sampling)
-    """
-    model = Sequential([layers.Input(shape=input_shape)])
+# ── tiny LSTM factory compatible with core/build.py ────────────────────────
+def build_lstm_model(
+    hp: kt.HyperParameters,
+    input_shape,
+    huber_delta: float | None = None,
+):
+    model = tf.keras.Sequential(name="lstm_forecaster")
+    model.add(layers.Input(shape=input_shape))
 
-    # shared hyperparameter names
+    # first LSTM
     units = hp.Int("units", 32, 128, step=32)
-    dropout_rate = hp.Float("dropout_rate", 0.0, 0.5, step=0.1)
-
-    # first LSTM + dropout
-    model.add(layers.LSTM(units, return_sequences=True))
-    model.add(layers.Dropout(dropout_rate))
+    model.add(layers.LSTM(units, return_sequences=hp.Boolean("use_second_lstm")))
+    model.add(layers.Dropout(hp.Float("dropout_rate", 0.0, 0.5, step=0.1)))
 
     # optional second LSTM
-    if hp.Boolean("use_second_lstm"):
+    if hp.get("use_second_lstm"):
         units2 = hp.Int("units2", 32, 128, step=32)
         model.add(layers.LSTM(units2))
-        model.add(layers.Dropout(dropout_rate))
-    else:
-        # reuse `units` if no second layer
-        model.add(layers.LSTM(units))
-        model.add(layers.Dropout(dropout_rate))
+        model.add(layers.Dropout(hp.get("dropout_rate")))
 
-    # final dense
-    model.add(layers.Dense(1))
+    # output
+    model.add(layers.Dense(1, name="log_return"))
 
     # compile
     lr = hp.Float("learning_rate", 1e-4, 1e-2, sampling="log")
     loss_fn = losses.Huber(delta=huber_delta) if huber_delta else "mse"
+
     model.compile(
         optimizer=optimizers.Adam(learning_rate=lr),
         loss=loss_fn,

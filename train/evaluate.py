@@ -1,53 +1,55 @@
-import numpy as np
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
 import logging
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import tensorflow as tf
 
-def backtest_strategy(model, X_test, scaler, data, window_size):
-    """
-    Evaluates strategy with directional accuracy and cumulative return.
-    """
-    predicted = model.predict(X_test, verbose=0).flatten()
 
-    # Rescale predictions to original Close prices
-    cmin, cmax = scaler.data_min_[3], scaler.data_max_[3]
-    predicted_prices = predicted * (cmax - cmin) + cmin
+def backtest_strategy(model: tf.keras.Model, X_test, data: pd.DataFrame, window_size: int):
+    """
+    Given a model that forecasts *log-return*, compute
+
+      • directional accuracy
+      • cumulative (log) return of a naïve long/short strategy
+      • returns a tuple  (accuracy, cumulative_return)
+    """
+    log_rets_hat = model.predict(X_test, verbose=0)[0].flatten()
 
     start_idx = len(data) - (len(X_test) + window_size)
-    test_indices = np.arange(start_idx + window_size, len(data))
+    test_idx = np.arange(start_idx + window_size, len(data))
 
-    actual_prices = data['Close'].iloc[test_indices].values
-    prev_prices = data['Close'].iloc[test_indices - 1].values
+    prev_px = data["Close"].iloc[test_idx - 1].values  # P(t)
+    actual_px = data["Close"].iloc[test_idx].values    # P(t+1)
+    pred_px = prev_px * np.exp(log_rets_hat)           # P̂(t+1)
 
-    actual_returns = (actual_prices / prev_prices) - 1.0
-    predicted_returns = (predicted_prices / actual_prices) - 1.0
+    fee = 0.0002
+    actual_ret = actual_px / prev_px - 1.0 - fee
+    pred_ret = pred_px / prev_px - 1.0  # what the model *thinks* will happen
 
-    # Directional accuracy
-    accuracy = np.mean(np.sign(predicted_returns) == np.sign(actual_returns))
+    accuracy = np.mean(np.sign(actual_ret) == np.sign(pred_ret))
 
-    # Strategy returns
-    strategy_returns = np.where(predicted_returns > 0, actual_returns, -actual_returns)
-    strategy_returns = np.clip(strategy_returns, -0.99, 0.99)
-    log_returns = np.log1p(strategy_returns)
-    cum_return = np.expm1(np.sum(log_returns))
+    # naïve “go long if model says up, go short if down”
+    strategy_ret = np.where(pred_ret > 0, actual_ret, -actual_ret)
+    strategy_ret = np.clip(strategy_ret, -0.99, 0.99)  # guard rails
+    cum_return = np.expm1(np.log1p(strategy_ret).sum())
 
-    logging.info(f"🎯 Directional Accuracy: {accuracy:.2%}")
-    logging.info(f"📈 Cumulative Return: {cum_return:.2%}")
+    logging.info(f"🎯 Directional accuracy: {accuracy:.2%}")
+    logging.info(f"📈 Cumulative return  : {cum_return:.2%}")
 
-    return accuracy, cum_return
+    return float(accuracy), float(cum_return)
 
 
-def plot_predictions(predicted_prices, actual_prices):
-    """
-    Plots predicted vs. actual prices.
-    """
+def plot_predictions(pred_px: np.ndarray, actual_px: np.ndarray):
     plt.figure(figsize=(12, 5))
-    plt.plot(actual_prices, label="Actual", linewidth=2)
-    plt.plot(predicted_prices, label="Predicted", linewidth=2)
-    plt.title("Predicted vs Actual Close Prices")
+    plt.plot(actual_px, label="Actual", lw=2)
+    plt.plot(pred_px, label="Predicted", lw=2)
+    plt.title("Predicted vs. Actual Close")
     plt.xlabel("Time")
     plt.ylabel("Price")
-    plt.legend()
     plt.grid(True)
+    plt.legend()
     plt.tight_layout()
     plt.show()
