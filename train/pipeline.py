@@ -178,44 +178,55 @@ def train_predict_for_ticker(
     df = enrich_features(df)
 
     # ── feature subset (may be pruned)
-    all_feats = get_feature_columns()
-    pruned = load_pruned_features(ticker)
-    feats_in_use = [f for f in all_feats if f not in (pruned or [])]
-
+    # Find latest model version directory
+    model_base = Path("models") / ticker
+    import re
+    ts_pattern = re.compile(r"^\d{8}_\d{6}$")
+    versions = [d for d in model_base.iterdir() if d.is_dir() and ts_pattern.match(d.name)]
+    versions = sorted(versions, reverse=True)
+    if not versions:
+        logging.error(f"❌ No versioned subdirectory found for {ticker} in models/")
+        raise FileNotFoundError(f"No versioned subdirectory found for {ticker} in models/")
+    latest_version_dir = versions[0]
+    # Load actual feature list from metadata.json in latest model dir
+    metadata_path = latest_version_dir / "metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        # If features are saved as a list of names, use them; if shape, fallback to get_feature_columns()
+        feats_in_use = metadata.get("feature_names") if "feature_names" in metadata else get_feature_columns()
+    else:
+        feats_in_use = get_feature_columns()
     win = 60 if len(df) >= 600 else 30
     X_tr, y_tr, X_te, y_te, scaler = build_sequences(df, feats_in_use, window_size=win)
 
-    # ── model load / train
-    try:
-        model = load_model(ticker)
-        logging.info("📦 model loaded")
-    except FileNotFoundError:
-        logging.info("🛠️ training from scratch (full feature set)")
-        model, _, best_hp = train_and_save_model(X_tr, y_tr, X_tr.shape[1:], ticker)
-
-    # ── sensitivity → prune bottom PRUNE_PCT %
-    if pruned is None:
-        last_seq_full = X_te[-1:][...]
-        sens = compute_feature_sensitivity(model, last_seq_full, feats_in_use)
-        thresh = np.percentile(list(sens.values()), PRUNE_PCT)
-        weak = [f for f, v in sens.items() if v <= thresh]
-
-        if weak and len(weak) < len(all_feats) * 0.5:   # keep at least 50 %
-            logging.info("✂️  Pruning %d weak features: %s", len(weak), weak)
-            # rebuild sequences WITHOUT the weak features
-            feats_pruned = [f for f in feats_in_use if f not in weak]
-            X_tr_p, y_tr_p, X_te_p, y_te_p, _ = build_sequences(
-                df, feats_pruned, window_size=win
-            )
-            # reuse same HPs → fast retrain
-            model, _, _ = train_and_save_model(X_tr_p, y_tr_p,
-                                               X_tr_p.shape[1:], ticker)
-            version_dir = Path("models") / ticker / sorted(
-                (Path("models") / ticker).iterdir(), reverse=True
-            )[0].name
-            save_pruned_features(ticker, weak, version_dir)
-            feats_in_use = feats_pruned
-            X_te = X_te_p  # update inference seq
+    # ── model load only
+    model_base = Path("models") / ticker
+    if not model_base.exists():
+        logging.error(f"❌ No model directory found for {ticker} in models/")
+        raise FileNotFoundError(f"No model directory found for {ticker} in models/")
+    # Only use timestamped subdirectories (ignore files like LATEST_pruned_features.json)
+    import re
+    ts_pattern = re.compile(r"^\d{8}_\d{6}$")
+    versions = [d for d in model_base.iterdir() if d.is_dir() and ts_pattern.match(d.name)]
+    versions = sorted(versions, reverse=True)
+    if not versions:
+        logging.error(f"❌ No versioned subdirectory found for {ticker} in models/")
+        raise FileNotFoundError(f"No versioned subdirectory found for {ticker} in models/")
+    expected_model_path = versions[0] / "model.h5"
+    logging.info(f"🔎 Checking for model at: {expected_model_path}")
+    if expected_model_path.exists():
+        logging.info(f"✅ Found model for {ticker} at {expected_model_path}")
+        try:
+            latest_version = versions[0].name
+            model = load_model(ticker, version_timestamp=latest_version)
+            logging.info(f"📦 model loaded from {expected_model_path}")
+        except FileNotFoundError as e:
+            logging.error(f"❌ Model loading failed: {e}")
+            raise
+    else:
+        logging.error(f"❌ Model file missing at {expected_model_path}")
+        raise FileNotFoundError(f"Model file missing at {expected_model_path}")
 
     # ── forecast
     current_px = float(df["Close"].iloc[-1])

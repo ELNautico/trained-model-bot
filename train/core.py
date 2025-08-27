@@ -1,3 +1,8 @@
+
+from __future__ import annotations
+import pandas as pd
+from core.sensitivity import compute_feature_sensitivity
+from core.features import get_feature_columns
 """
 train/core.py
 • HParam-tuning (dual-head Transformer: d1 & d5)
@@ -6,7 +11,6 @@ train/core.py
 • Versioned saving / loading
 • Price reconstruction (uses d1 head)
 """
-from __future__ import annotations
 
 import json
 from datetime import datetime
@@ -28,6 +32,7 @@ def _rename_all(layer: tf.keras.layers.Layer, suffix: str) -> None:
             _rename_all(sub, suffix)
 
 
+import re
 # ─────────────────────────────────────────────────────────────────────────────
 #  Train, ensemble & save
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +124,60 @@ def train_and_save_model(
         json.dump(metadata, f, indent=4)
     print(f"📝 Saved metadata to {out_dir / 'metadata.json'}")
     print(f"✅ Saved ensemble to {out_dir}")
+
+    # Feature sensitivity & pruning (save pruned features)
+    from train.pipeline import save_pruned_features, build_sequences
+
+    all_feats = get_feature_columns()
+    if len(all_feats) > 10:
+        last_seq = X_train[-1:][...]
+        sens = compute_feature_sensitivity(ensemble, last_seq, all_feats)
+        PRUNE_PCT = 30
+        thresh = np.percentile(list(sens.values()), PRUNE_PCT)
+        weak = [f for f, v in sens.items() if v <= thresh]
+        if weak and len(weak) < len(all_feats) * 0.5:
+            print(f"✂️  Pruning {len(weak)} weak features: {weak}")
+            feats_pruned = [f for f in all_feats if f not in weak]
+            win = 60 if X_train.shape[0] >= 600 else 30
+            # Rebuild sequences with pruned features
+            from train.pipeline import cached_download, enrich_features
+            df_full = enrich_features(cached_download(ticker))
+            X_tr_p, y_tr_p, _, _, _ = build_sequences(
+                df_full, feats_pruned, window_size=win
+            )
+            # Retrain ensemble with pruned features
+            pruned_seed_models = []
+            for s in range(n_seeds):
+                tf.keras.backend.clear_session()
+                tf.keras.utils.set_random_seed(s)
+                m = build_transformer_model(best_hp, X_tr_p.shape[1:])
+                _rename_all(m, f"pruned_seed{s}")
+                m.fit(
+                    X_tr_p,
+                    [y_tr_p["d1"], y_tr_p["d5"]],
+                    epochs=50,
+                    validation_split=0.2,
+                    verbose=1,
+                )
+                pruned_seed_models.append(m)
+
+            ens_inp_p = tf.keras.Input(shape=X_tr_p.shape[1:], name="ensemble_input_pruned")
+            d1_list_p, d5_list_p = [], []
+            for mdl in pruned_seed_models:
+                d1_pred, d5_pred = mdl(ens_inp_p)
+                d1_list_p.append(d1_pred)
+                d5_list_p.append(d5_pred)
+            avg_d1_p = tf.keras.layers.Average(name="d1")(d1_list_p)
+            avg_d5_p = tf.keras.layers.Average(name="d5")(d5_list_p)
+            ensemble_pruned = tf.keras.Model(ens_inp_p, [avg_d1_p, avg_d5_p], name="xf_ensemble_pruned")
+            ensemble_pruned.compile(
+                optimizer="adam",
+                loss=dict(d1="mse", d5="mse"),
+                metrics=dict(d1=["mae"], d5=["mae"]),
+            )
+            # Save pruned features
+            save_pruned_features(ticker, weak, out_dir)
+            print(f"📝 Saved pruned features to {out_dir / 'pruned_features.json'} and LATEST_pruned_features.json")
     return ensemble, None, best_hp
 
 
@@ -133,7 +192,9 @@ def load_model(ticker: str, *, version_timestamp: str | None = None) -> tf.keras
     """
     base = Path("models") / ticker
     if version_timestamp is None:
-        versions = sorted(base.iterdir(), reverse=True)
+        ts_pattern = re.compile(r"^\d{8}_\d{6}$")
+        versions = [d for d in base.iterdir() if d.is_dir() and ts_pattern.match(d.name)]
+        versions = sorted(versions, reverse=True)
         if not versions:
             raise FileNotFoundError(f"No model for {ticker}")
         mdl_path = versions[0] / "model.h5"
