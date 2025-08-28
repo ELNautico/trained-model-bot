@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  trained-model-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: trained-model-bot
+    restart: unless-stopped
+    tty: true
