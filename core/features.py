@@ -146,6 +146,21 @@ def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
     df = add_cmf(df)
     df = add_volatility_regime(df)
 
+    # Add lagged features (1, 3, 7 days)
+    for col in ['Close', 'Volume']:
+        for lag in [1, 3, 7]:
+            df[f'{col}_lag{lag}'] = df[col].shift(lag)
+
+    # Add rolling statistics (window: 7, 14, 30 days)
+    for col in ['Close', 'Volume']:
+        for win in [7, 14, 30]:
+            df[f'{col}_rollmean{win}'] = df[col].rolling(win).mean()
+            df[f'{col}_rollstd{win}'] = df[col].rolling(win).std()
+            df[f'{col}_rollmin{win}'] = df[col].rolling(win).min()
+            df[f'{col}_rollmax{win}'] = df[col].rolling(win).max()
+            df[f'{col}_rollskew{win}'] = df[col].rolling(win).skew()
+            df[f'{col}_rollkurt{win}'] = df[col].rolling(win).kurt()
+
     # Clean up
     df.ffill(inplace=True)
     df.bfill(inplace=True)
