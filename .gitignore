@@ -14,5 +14,5 @@ bot.db
 .vscode/
 tuning_logs/
 .idea/
-./logs/training
-./cache/
+logs/training/
+cache/
