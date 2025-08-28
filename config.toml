@@ -4,3 +4,6 @@ chat_id   = "8074434283"
 
 [twelvedata]
 api_key = "91bd02e2b9774a1591bdde0b6e382e96"
+
+[alphavantage]
+alva_api_key = "F4L15PTO0OVERK65"

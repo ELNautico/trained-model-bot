@@ -173,8 +173,10 @@ def train_predict_for_ticker(
     risk_per_trade: float = 0.01,
 ):
     logging.info("🚀 %s – pipeline start", ticker)
-    df = cached_download(ticker)
 
+    df = cached_download(ticker)
+    # Pass ticker to DataFrame attrs for sentiment feature
+    df.attrs['ticker'] = ticker
     df = enrich_features(df)
 
     # ── feature subset (may be pruned)

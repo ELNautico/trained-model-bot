@@ -30,9 +30,9 @@ class TimeSeriesHyperband(kt.Hyperband):
                 m.evaluate(X[val_idx], y[val_idx], verbose=0)[0]
             )
 
-        mean_loss = float(np.mean(losses))
-        # report to tuner under the objective name
-        self.oracle.update_trial(trial.trial_id, {"val_loss": mean_loss})
+    mean_loss = float(np.mean(losses))
+    # report to tuner under the objective name
+    self.oracle.update_trial(trial.trial_id, {"loss": mean_loss})
 
 
 def tune_model(X_train, y_train, input_shape, project_name):
@@ -80,7 +80,7 @@ def bayesian_tune(X_train, y_train, input_shape, project_name, max_trials=20, in
 
     tuner = kt.BayesianOptimization(
         hypermodel=lambda hp: build_lstm_model(hp, input_shape, huber_delta),
-        objective=kt.Objective("val_loss", "min"),
+        objective=kt.Objective("loss", "min"),
         max_trials=max_trials,
         num_initial_points=init_points,
         directory="tuning_logs",

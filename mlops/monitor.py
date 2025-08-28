@@ -15,7 +15,7 @@ from typing import Tuple
 from scipy.stats import ks_2samp
 
 from storage import DB, get_watchlist
-from jobs import retrain_job   # re-use your existing function
+from mlops.utils import retrain_job   # re-use your existing function
 
 
 # ─────────────────────────────────────────────────────────────────────────────

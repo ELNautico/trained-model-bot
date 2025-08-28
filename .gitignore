@@ -15,4 +15,5 @@ bot.db
 tuning_logs/
 .idea/
 logs/training/
+.cache/
 cache/

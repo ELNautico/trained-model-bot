@@ -235,6 +235,8 @@ def retrain_job(force: bool = False):
             send(f"❌ Fine-tune failed for {ticker}: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+from mlops.utils import retrain_job  # Importing retrain_job from mlops/utils.py
+
 def help_job():
     help_text = (
         "🧠 *Available Commands:*\n\n"
@@ -269,7 +271,4 @@ def _cli():
     elif job == "drift":
         drift_job()
     else:
-        print("Usage: jobs.py [forecast|evaluate|retrain|retrain_force|help]")
-
-if __name__ == "__main__":
-    _cli()
+        print("Usage: jobs.py [forecast|evaluate|retrain|retrain_force|help|drift]")

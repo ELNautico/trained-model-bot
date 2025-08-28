@@ -72,7 +72,7 @@ def tune_and_train_model(X_train, y_train, input_shape, project_name="lstm_model
 
     # Final fit on full data
     early_stop = kt.callbacks.EarlyStopping(
-        monitor='val_loss', patience=5, restore_best_weights=True
+        monitor='loss', patience=5, restore_best_weights=True
     )
     reduce_lr = kt.callbacks.ReduceLROnPlateau(
         monitor='val_loss', factor=0.5, patience=3, min_lr=1e-5

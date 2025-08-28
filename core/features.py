@@ -1,8 +1,55 @@
+import requests
 import pandas as pd
 import numpy as np
 from sklearn.mixture import GaussianMixture
 import logging
+import toml, pathlib
 
+def fetch_sentiment_alpha_vantage(ticker: str, api_key: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Fetches news sentiment scores from Alpha Vantage for a given ticker and date range.
+    Returns a DataFrame with date and sentiment score.
+    """
+    url = f"https://www.alphavantage.co/query"
+    # Expand date range to last 30 days for more news coverage
+    import datetime
+    try:
+        end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+    except Exception:
+        end_dt = datetime.datetime.utcnow()
+    start_dt = end_dt - datetime.timedelta(days=30)
+    # Format as YYYYMMDDT0000 (midnight)
+    start_date_fmt = start_dt.strftime("%Y%m%dT0000")
+    end_date_fmt = end_dt.strftime("%Y%m%dT0000")
+    params = {
+        "function": "NEWS_SENTIMENT",
+        "tickers": ticker,
+        "apikey": api_key,
+        "time_from": start_date_fmt,
+        "time_to": end_date_fmt,
+        "sort": "LATEST",
+        "limit": 100
+    }
+    r = requests.get(url, params=params)
+    if r.status_code != 200:
+        logging.warning(f"Alpha Vantage sentiment API error: {r.status_code}")
+        return pd.DataFrame()
+    data = r.json()
+    if "feed" not in data:
+        logging.warning("No sentiment feed returned from Alpha Vantage.")
+        return pd.DataFrame()
+    rows = []
+    for item in data["feed"]:
+        # Parse full time_published string (YYYYMMDDTHHMMSS)
+        date_str = item.get("time_published", "")
+        try:
+            date = pd.to_datetime(date_str, format="%Y%m%dT%H%M%S")
+        except Exception:
+            date = pd.to_datetime(date_str, errors="coerce")
+        sentiment = item.get("overall_sentiment_score", 0)
+        rows.append({"date": date, "sentiment": sentiment})
+    df_sent = pd.DataFrame(rows)
+    return df_sent
 
 def add_bollinger_bands(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     """
@@ -160,6 +207,46 @@ def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
             df[f'{col}_rollmax{win}'] = df[col].rolling(win).max()
             df[f'{col}_rollskew{win}'] = df[col].rolling(win).skew()
             df[f'{col}_rollkurt{win}'] = df[col].rolling(win).kurt()
+
+    # Add sentiment feature from Alpha Vantage
+    # Requires 'ticker' and date range; fallback to index if not present
+    _cfg = toml.load(pathlib.Path(__file__).with_name("config.toml"))
+    api_key = _cfg["alphavantage"]["alva_api_key"]
+
+    if 'ticker' in df.attrs:
+        ticker = df.attrs['ticker']
+    else:
+        ticker = None
+    if ticker:
+        start_date = str(df.index.min())[:10]
+        end_date = str(df.index.max())[:10]
+        df_sent = fetch_sentiment_alpha_vantage(ticker, api_key, start_date, end_date)
+        if not df_sent.empty:
+            df_sent = df_sent.set_index('date')
+            # Remove duplicate index labels in both DataFrames before reindexing
+            df_sent = df_sent[~df_sent.index.duplicated(keep='first')]
+            df = df[~df.index.duplicated(keep='first')]
+            # Ensure both indexes are timezone-naive, then localize to UTC if required
+            if hasattr(df.index, 'tz') and df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            if hasattr(df_sent.index, 'tz') and df_sent.index.tz is not None:
+                df_sent.index = df_sent.index.tz_localize(None)
+            # Localize to UTC if tz-naive and required downstream
+            if not hasattr(df.index, 'tz') or df.index.tz is None:
+                try:
+                    df.index = df.index.tz_localize('UTC')
+                except Exception:
+                    pass
+            if not hasattr(df_sent.index, 'tz') or df_sent.index.tz is None:
+                try:
+                    df_sent.index = df_sent.index.tz_localize('UTC')
+                except Exception:
+                    pass
+            df['sentiment'] = df_sent['sentiment'].reindex(df.index, method='ffill').fillna(0)
+        else:
+            df['sentiment'] = 0
+    else:
+        df['sentiment'] = 0
 
     # Clean up
     df.ffill(inplace=True)

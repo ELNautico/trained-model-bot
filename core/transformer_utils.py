@@ -97,7 +97,7 @@ class _WFHyperband(kt.Hyperband):
                 {k: v[tr_idx] for k, v in y.items()},
                 epochs     = epochs_per_fold,
                 verbose    = 0,
-                callbacks  = [tf.keras.callbacks.EarlyStopping(patience=3,
+                callbacks  = [tf.keras.callbacks.EarlyStopping(monitor='loss', patience=3,
                                                                restore_best_weights=True)],
             )
             loss = m.evaluate(
@@ -108,8 +108,8 @@ class _WFHyperband(kt.Hyperband):
             losses.append(loss)
 
         mean_loss = float(np.mean(losses))
-        self.oracle.update_trial(trial.trial_id, {"val_loss": mean_loss})
-        return {"val_loss": mean_loss}
+        self.oracle.update_trial(trial.trial_id, {"loss": mean_loss})
+        return {"loss": mean_loss}
 
 
 # ──────────────────────────────────────────────
@@ -124,7 +124,7 @@ def tune_transformer(
 ):
     tuner = _WFHyperband(
         hypermodel   = lambda hp: build_transformer_model(hp, input_shape),
-        objective    = kt.Objective("val_loss", "min"),
+        objective    = kt.Objective("loss", "min"),
         max_epochs   = 30,
         factor       = 3,
         directory    = "tuning_logs",
