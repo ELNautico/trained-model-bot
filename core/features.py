@@ -210,7 +210,8 @@ def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Add sentiment feature from Alpha Vantage
     # Requires 'ticker' and date range; fallback to index if not present
-    _cfg = toml.load(pathlib.Path(__file__).with_name("config.toml"))
+    import os
+    _cfg = toml.load(os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.toml"))
     api_key = _cfg["alphavantage"]["alva_api_key"]
 
     if 'ticker' in df.attrs:

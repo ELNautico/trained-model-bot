@@ -21,15 +21,15 @@ def walk_forward(
     # Start after enough history
     for t in range(window_size + 5, len(df)):
         sub = df.iloc[:t]
-        X_train, y_train, X_test, y_test, scaler, _ = prepare_data_and_split(sub, window_size)
+    X_train, y_train, X_test, y_test, scaler, _ = prepare_data_and_split(sub, window_size=window_size)
 
-        # retrain on first step or every N steps
-        if model is None or ((t - (window_size+5)) % retrain_every == 0):
-            model, _hist, _hp = train_and_save_model(X_train, y_train, X_train.shape[1:], ticker)
-            last_retrain_idx = t
+    # retrain on first step or every N steps
+    if model is None or ((t - (window_size+5)) % retrain_every == 0):
+        model, _hist, _hp = train_and_save_model(X_train, y_train, X_train.shape[1:], ticker)
+        last_retrain_idx = t
 
         # predict next day (the last row of X_test)
-        pred = predict_price(model, X_test[-1:], scaler)
+        pred = predict_price(model, X_test[-1:], closes[t-1])
         actual = closes[t]
 
         err = pred - actual
