@@ -142,9 +142,12 @@ def build_sequences(
     last_idx = len(df) - 5
 
     def _append(X, y1, y5, i):
-        X.append(sc_all[i - window_size : i])
-        y1.append(np.log(close[i] / close[i - 1]))        # 1-day return
-        y5.append(np.log(close[i + 4] / close[i - 1]))    # 5-day return
+        window = sc_all[i - window_size : i]
+        # Only append if window is correct shape
+        if window.shape == (window_size, len(feats)):
+            X.append(window)
+            y1.append(np.log(close[i] / close[i - 1]))        # 1-day return
+            y5.append(np.log(close[i + 4] / close[i - 1]))    # 5-day return
 
     for i in range(window_size, split - 5):
         _append(X_tr, y1_tr, y5_tr, i)
@@ -283,6 +286,10 @@ def prepare_data_and_split(
     """
     df = enrich_features(df)
 
+    # Ensure all required feature columns exist, fill missing with NaN
+    for col in get_feature_columns():
+        if col not in df.columns:
+            df[col] = np.nan
     feats = [f for f in get_feature_columns() if f in df.columns]
     X_tr, y_tr, X_te, y_te, scaler = build_sequences(
         df,

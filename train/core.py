@@ -45,6 +45,11 @@ def train_and_save_model(
     n_seeds: int = 3,
 ):
     print(f"🔧 Hyper-parameter tuning for {ticker} …")
+    # Ensure enough samples for cross-validation
+    min_samples = 2  # Number of folds for CV
+    if X_train.shape[0] < min_samples:
+        print(f"Skipping training: not enough samples for CV (required={min_samples}, got={X_train.shape[0]})")
+        return None, None, None
     _, best_hp = tune_transformer(
         X_train, y_train, input_shape, project_name=f"xf_{ticker}"
     )
