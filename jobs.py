@@ -22,6 +22,7 @@ from train.core import train_and_save_model, load_model
 from tensorflow.keras.optimizers import Adam
 from mlops.monitor import drift_job
 import tensorflow as tf
+from walk_forward import walk_forward
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -251,6 +252,19 @@ def help_job():
         "❓ /help – Show this message."
     )
     send(help_text)
+
+# ─────────────────────────────────────────────────────────────────────────────
+def walk_forward_job():
+    for ticker in get_watchlist():
+        try:
+            print(f"Running walk-forward for {ticker}...")
+            # Use default window and retrain_every, or customize as needed
+            # You can adjust window size here if you want
+            walk_forward(ticker, window_size=30, retrain_every=1)
+            send(f"✅ Walk-forward validation complete for {ticker}.")
+        except Exception as e:
+            logging.error(f"❌ Walk-forward failed for {ticker}: {e}")
+            send(f"❌ Walk-forward failed for {ticker}: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 def _cli():

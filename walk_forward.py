@@ -29,6 +29,11 @@ def walk_forward(
         print(f"sub columns at t={t}:", sub.columns)
         print(f"sub shape at t={t}:", sub.shape)
         print(f"Any NaNs at t={t}:", sub.isnull().any().any())
+        if sub is None or sub.shape[0] == 0:
+            print(f"Skipping t={t}: feature engineering resulted in empty DataFrame.")
+            continue
+        # Pass raw DataFrame slice to prepare_data_and_split
+        print(f"sub columns at t={t}:", sub.columns)
         X_train, y_train, X_test, y_test, scaler, _ = prepare_data_and_split(sub, window_size=window_size)
 
         # skip if X_train is empty or 1D

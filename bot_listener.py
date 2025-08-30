@@ -15,6 +15,7 @@ from telegram.ext import (
 from storage import init_db, add_to_watchlist, remove_from_watchlist, get_watchlist
 from train.pipeline import train_predict_for_ticker
 from train.core import train_and_save_model, load_model, predict_price
+from jobs import walk_forward_job
 
 # --- load config ---
 _cfg = toml.load(Path(__file__).with_name("config.toml"))
@@ -157,6 +158,16 @@ async def list_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         formatted = "\n".join(f"• `{t}`" for t in tickers)
         await update.message.reply_text(f"📋 *Your Watchlist:*\n{formatted}", parse_mode="Markdown")
 
+@restricted
+async def validate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🕑 Running walk-forward validation for all tickers…")
+    try:
+        await asyncio.to_thread(walk_forward_job)
+        await msg.edit_text("✅ Walk-forward validation complete for all tickers.")
+    except Exception as e:
+        logging.error(f"Walk-forward validation failed: {e}")
+        await msg.edit_text(f"❌ Walk-forward validation failed: {e}")
+
 def main():
     init_db()
     app = ApplicationBuilder().token(TOKEN).build()
@@ -168,6 +179,7 @@ def main():
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("watchlist", list_watchlist))
+    app.add_handler(CommandHandler("validate", validate))
 
     app.run_polling()
 
