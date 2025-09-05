@@ -245,7 +245,7 @@ def help_job():
         "📈 /forecast – Run model and send today's market predictions.\n\n"
         "📊 /evaluate – Compare today's forecasts to actual prices.\n\n"
         "🔄 /retrain – Retrain models only if missing.\n\n"
-        "🔄 /validate – Validate Models after Training.\n\n"
+        "🔄 /validate – Validate all models using walk-forward backtest.\n\n"
         "⚠️ /retrain_force – Force retraining of all models, even if trained.\n\n"
         "🚨 /drift – Run drift-detection; retrains only models that show data drift.\n\n"
         "📥 /add TICKER – Add a stock ticker to your watchlist.\n\n"
@@ -268,6 +268,16 @@ def walk_forward_job():
             logging.error(f"❌ Walk-forward failed for {ticker}: {e}")
             send(f"❌ Walk-forward failed for {ticker}: {e}")
 
+def validate_job():
+    for ticker in get_watchlist():
+        try:
+            print(f"Validating model for {ticker}...")
+            walk_forward(ticker, window_size=60, retrain_every=10)
+            send(f"✅ Validation complete for {ticker}.")
+        except Exception as e:
+            logging.error(f"❌ Validation failed for {ticker}: {e}")
+            send(f"❌ Validation failed for {ticker}: {e}")
+            
 # ─────────────────────────────────────────────────────────────────────────────
 def _audit_df(df: pd.DataFrame, ticker: str, cal_name: str) -> str:
     issues = []
@@ -415,9 +425,10 @@ def _cli():
         drift_job()
     elif job == "audit":
         audit_data_job()
+    elif job == "validate":
+        validate_job()
     else:
-        print("Usage: jobs.py [forecast|evaluate|retrain|retrain_force|help|drift|audit]")
-
+        print("Usage: jobs.py [forecast|evaluate|retrain|retrain_force|help|drift|audit|validate]")
 
 if __name__ == "__main__":
     _cli()
