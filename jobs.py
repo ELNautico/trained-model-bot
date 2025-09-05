@@ -6,6 +6,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
+import pandas as pd
 
 from storage import (
     init_db,
@@ -244,6 +245,7 @@ def help_job():
         "📈 /forecast – Run model and send today's market predictions.\n\n"
         "📊 /evaluate – Compare today's forecasts to actual prices.\n\n"
         "🔄 /retrain – Retrain models only if missing.\n\n"
+        "🔄 /validate – Validate Models after Training.\n\n"
         "⚠️ /retrain_force – Force retraining of all models, even if trained.\n\n"
         "🚨 /drift – Run drift-detection; retrains only models that show data drift.\n\n"
         "📥 /add TICKER – Add a stock ticker to your watchlist.\n\n"
@@ -267,6 +269,133 @@ def walk_forward_job():
             send(f"❌ Walk-forward failed for {ticker}: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+def _audit_df(df: pd.DataFrame, ticker: str, cal_name: str) -> str:
+    issues = []
+    summary = []
+
+    # Basic shape and columns
+    cols = list(df.columns)
+    summary.append(f"{ticker}: shape={df.shape}, columns={cols}")
+
+    # Index checks
+    idx = df.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        issues.append("Index is not DatetimeIndex.")
+    else:
+        if not idx.is_monotonic_increasing:
+            issues.append("Datetime index not sorted ascending.")
+        if idx.tz is None:
+            issues.append("Datetime index is timezone-naive.")
+        # Duplicates
+        dup_count = idx.duplicated().sum()
+        if dup_count:
+            issues.append(f"Duplicate timestamps: {dup_count}")
+
+    # Column presence
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    missing_cols = sorted(list(required - set(cols)))
+    if missing_cols:
+        issues.append(f"Missing columns: {missing_cols}")
+
+    # NaNs
+    na_counts = df.isna().sum()
+    na_total = int(na_counts.sum())
+    if na_total:
+        issues.append(
+            f"NaNs total: {na_total}, by column: {na_counts[na_counts>0].to_dict()}"
+        )
+
+    # Obvious bad values
+    neg_or_zero = {}
+    for c in ["Open", "High", "Low", "Close"]:
+        if c in df:
+            bad = int((df[c] <= 0).sum())
+            if bad:
+                neg_or_zero[c] = bad
+    if "Volume" in df:
+        vol_zero = int((df["Volume"] <= 0).sum())
+        if vol_zero:
+            neg_or_zero["Volume<=0"] = vol_zero
+    if neg_or_zero:
+        issues.append(f"Non-positive values: {neg_or_zero}")
+
+    # Frequency/gaps (trading days)
+    try:
+        if isinstance(idx, pd.DatetimeIndex) and len(df) > 5:
+            start = idx.min().date()
+            end = idx.max().date()
+            cal = mcal.get_calendar(cal_name)
+            sched = cal.schedule(start_date=start, end_date=end)
+            # Convert schedule index to same tz as data index if possible
+            sched_index = sched.index
+            if getattr(sched_index, "tz", None) is not None:
+                sched_index = sched_index.tz_convert(idx.tz)
+            else:
+                try:
+                    sched_index = sched_index.tz_localize(idx.tz)
+                except Exception:
+                    pass
+            # Compare by date to avoid intraday alignment issues
+            data_days = pd.DatetimeIndex(pd.to_datetime(idx.date)).unique()
+            sched_days = pd.DatetimeIndex(pd.to_datetime(sched_index.date)).unique()
+            missing = sched_days.difference(data_days)
+            extra = data_days.difference(sched_days)
+            if len(missing) > 0:
+                issues.append(
+                    f"Missing {len(missing)} trading days in range [{start}..{end}]"
+                )
+            if len(extra) > 0:
+                issues.append(f"Has {len(extra)} non-trading days present")
+            summary.append(f"Date range: {start} → {end}, rows={len(df)}")
+    except Exception as e:
+        issues.append(f"Calendar gap check failed: {e}")
+
+    # Outlier-ish jumps (simple)
+    try:
+        if "Close" in df and len(df) > 20:
+            pct = df["Close"].pct_change().abs()
+            big = int((pct > 0.15).sum())
+            if big:
+                issues.append(f"{big} bars with >15% abs change in Close.")
+    except Exception as e:
+        issues.append(f"Outlier check failed: {e}")
+
+    # Head/tail snapshot
+    try:
+        head = df.head(3).to_string()
+        tail = df.tail(3).to_string()
+        summary.append("Head:\n" + head)
+        summary.append("Tail:\n" + tail)
+    except Exception:
+        pass
+
+    status = "OK" if not issues else "ISSUES"
+    report = [f"[{status}] Data audit for {ticker}"]
+    report += summary
+    if issues:
+        report.append("Problems:")
+        report += [f"- {x}" for x in issues]
+    return "\n".join(report)
+
+
+def audit_data_job():
+    for ticker in get_watchlist():
+        try:
+            cal_name = CALENDARS.get(ticker, "NYSE")
+            df = download_data(ticker)
+            report = _audit_df(df, ticker, cal_name)
+            print(report)
+            # Keep message short for alert channel
+            lines = report.splitlines()
+            short = lines[0]
+            if len(lines) > 1:
+                short += " | " + " ".join(lines[1:4])
+            send(short)
+        except Exception as e:
+            logging.error(f"❌ Audit failed for {ticker}: {e}")
+            send(f"❌ Audit failed for {ticker}: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 def _cli():
     import sys
     init_db()
@@ -284,5 +413,11 @@ def _cli():
         help_job()
     elif job == "drift":
         drift_job()
+    elif job == "audit":
+        audit_data_job()
     else:
-        print("Usage: jobs.py [forecast|evaluate|retrain|retrain_force|help|drift]")
+        print("Usage: jobs.py [forecast|evaluate|retrain|retrain_force|help|drift|audit]")
+
+
+if __name__ == "__main__":
+    _cli()

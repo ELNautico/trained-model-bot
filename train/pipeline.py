@@ -47,7 +47,9 @@ CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
 CACHE_TTL = timedelta(hours=24)
-MAX_RETURN_THRESHOLD = 0.10
+# Drop only truly absurd daily jumps (likely bad data). Adjusted prices should
+# already account for splits/dividends; keep this generous to avoid losing days.
+MAX_RETURN_THRESHOLD = 0.50
 MAX_STALE_DAYS = 2
 PRUNE_PCT = 30                      # bottom X % features to drop
 
@@ -86,8 +88,23 @@ def save_pruned_features(ticker: str, pruned: list[str], version_dir: Path):
     stop=stop_after_attempt(3),
 )
 def _download_raw_ohlcv(ticker: str) -> pd.DataFrame:
-    df = td.time_series(symbol=ticker, interval="1day",
-                        outputsize=5000, timezone="UTC").as_pandas()
+    try:
+        df = td.time_series(
+            symbol=ticker,
+            interval="1day",
+            outputsize=5000,
+            timezone="UTC",
+            adjustment="all",  # use adjusted data to avoid split/dividend jumps
+        ).as_pandas()
+    except TypeError:
+        # Some versions of twelvedata client don't accept 'adjustment' kwarg.
+        logging.warning("⚠️  TDClient.time_series doesn't support 'adjustment'; falling back to unadjusted data.")
+        df = td.time_series(
+            symbol=ticker,
+            interval="1day",
+            outputsize=5000,
+            timezone="UTC",
+        ).as_pandas()
     if df.empty:
         raise ValueError(f"Empty OHLCV for {ticker}")
     df.columns = [c.capitalize() for c in df.columns]
@@ -105,12 +122,17 @@ def cached_download(ticker: str) -> pd.DataFrame:
         df = _download_raw_ohlcv(ticker)
         joblib.dump(df, path)
 
+    # Soft filter for extreme outliers; log how many rows would be dropped.
     df["ret"] = df["Close"].pct_change()
-    df = df.loc[df["ret"].abs() <= MAX_RETURN_THRESHOLD].drop(columns="ret")
+    bad_mask = df["ret"].abs() > MAX_RETURN_THRESHOLD
+    bad_count = int(bad_mask.sum())
+    if bad_count:
+        logging.warning("⚠️  %s: dropping %d rows with > %.0f%% daily change",
+                        ticker, bad_count, MAX_RETURN_THRESHOLD * 100)
+        df = df.loc[~bad_mask]
+    df = df.drop(columns="ret")
 
-    gaps = df.index.to_series().diff() > pd.Timedelta(days=MAX_STALE_DAYS)
-    if gaps.any():
-        df = df.loc[~gaps]
+    # Do not drop rows after long gaps; retain data and let models handle.
     return df
 
 # ─────────────────────────────────────────────────────────────────────────────
