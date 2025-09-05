@@ -46,8 +46,11 @@ def walk_forward(
     closes = df["Close"].values
 
     errors, pct_errs, dirs = [], [], []
+    preds, actuals, prev_closes = [], [], []
     model = None
     last_retrain_idx = None
+    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(log_dir, exist_ok=True)
 
     # Start after enough history
     total_steps = len(df) - (window_size + 5)
@@ -93,6 +96,9 @@ def walk_forward(
         errors.append(err)
         pct_errs.append(err / actual * 100)
         dirs.append((pred - closes[t-1]) * (actual - closes[t-1]) > 0)
+        preds.append(pred)
+        actuals.append(actual)
+        prev_closes.append(closes[t-1])
 
 
     errors   = np.array(errors)
@@ -101,14 +107,29 @@ def walk_forward(
 
     # Diagnostics for troubleshooting
     abs_pct_errs = np.abs(pct_errs)
-    worst_idx = np.argsort(-abs_pct_errs)[:3]  # indices of 3 worst errors
-    # Map t index to date
     error_dates = [df.index[window_size + 5 + i] for i in range(len(errors))]
+    worst_idx = np.argsort(-abs_pct_errs)[:10]  # indices of 10 worst errors
     worst_dates = [str(error_dates[i]) for i in worst_idx]
     worst_vals = [pct_errs[i] for i in worst_idx]
     n_big_errs = int((abs_pct_errs > 10).sum())
     avg_pct = float(np.mean(abs_pct_errs))
     std_pct = float(np.std(abs_pct_errs))
+
+    # Save top 10 outliers to CSV for diagnostics
+    import csv
+    outlier_path = os.path.join(log_dir, f"walk_forward_{ticker}_outliers.csv")
+    with open(outlier_path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["date", "pct_error", "actual", "predicted", "prev_close"])
+        for i in worst_idx:
+            writer.writerow([
+                str(error_dates[i]),
+                f"{pct_errs[i]:.2f}",
+                f"{actuals[i]:.4f}",
+                f"{preds[i]:.4f}",
+                f"{prev_closes[i]:.4f}"
+            ])
+    print(f"Saved top 10 outliers to {outlier_path}")
 
     summary = (
         f"\n=== Walk-Forward Backtest: {ticker} ===\n"
