@@ -60,7 +60,7 @@ def check_ticker(
     return p_val, p_val < alpha
 
 
-def drift_job(
+def drift_job( 
     lookback: int = 5,
     baseline: int = 30,
     alpha: float = 0.05,

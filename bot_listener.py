@@ -1,8 +1,6 @@
 import logging
 import asyncio
 from pathlib import Path
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import toml
 from telegram import Update
@@ -12,10 +10,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from storage import init_db, add_to_watchlist, remove_from_watchlist, get_watchlist
-from train.pipeline import train_predict_for_ticker
-from train.core import train_and_save_model, load_model, predict_price
-from jobs import walk_forward_job
+from storage import (
+    init_db,
+    add_to_watchlist,
+    remove_from_watchlist,
+    get_watchlist,
+    list_positions,
+)
+from jobs import signal_job, evaluate_job, positions_job, help_job
 
 # --- load config ---
 _cfg = toml.load(Path(__file__).with_name("config.toml"))
@@ -32,9 +34,7 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = str(update.effective_chat.id)
         if chat_id != AUTHORIZED_CHAT_ID:
-            await update.message.reply_text(
-                "🚫 You are not authorized to use this bot."
-            )
+            await update.message.reply_text("🚫 You are not authorized to use this bot.")
             logging.warning("Unauthorized access attempt from %s", chat_id)
             return
         await func(update, context)
@@ -43,111 +43,81 @@ def restricted(func):
 
 @restricted
 async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🕑 Starting daily forecast…")
-    tickers = get_watchlist()
-    if not tickers:
-        return await msg.edit_text("📭 Your watchlist is empty. Add tickers with /add.")
+    """
+    Runs the NEW signal engine (BUY/WAIT/HOLD/SELL).
+    Kept as /forecast for backward compatibility with your bot UX.
+    """
+    msg = await update.message.reply_text("🕑 Running signal engine for your watchlist…")
 
-    for ticker in tickers:
-        version_dir = Path("models") / ticker
-        if not version_dir.exists() or not any(version_dir.iterdir()):
-            await msg.reply_text(f"🛠️ No model found for {ticker}. Training a new one now…")
+    try:
+        await asyncio.to_thread(signal_job, False)
+        await msg.edit_text("✅ Signal run complete. Check messages above for details.")
+    except Exception as e:
+        logging.error("Signal job failed: %s", e)
+        await msg.edit_text(f"❌ Signal job failed – {e}")
 
-        try:
-            result, _ = await asyncio.to_thread(
-                train_predict_for_ticker,
-                ticker, True, 100_000, 0.01
-            )
-
-            current   = result["Current Price"]
-            predicted = result["Predicted Price"]
-            conf      = result["Confidence"]
-            pct_chg   = result["Predicted % Change"]
-
-            direction = "Buy" if pct_chg > 0 else "Sell" if pct_chg < 0 else "Hold"
-
-            now   = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")) \
-                                     .astimezone(ZoneInfo("Europe/Vienna"))
-            ts_str = now.strftime("%d.%m at %H:%M")
-
-            text = (
-                f"Prediction on {ts_str}\n"
-                f"Current Price: {current:.2f}\n"
-                f"Predicted Close: {predicted:.2f} ({conf:.1f}%)\n\n"
-                f"Recommendation:\n"
-                f"{direction}"
-            )
-            await msg.reply_text(text)
-
-        except Exception as e:
-            logging.error("Forecast failed for %s: %s", ticker, e)
-            await msg.reply_text(f"❌ {ticker}: Forecast failed – {e}")
 
 @restricted
 async def evaluate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🕑 Running end-of-day evaluation…")
-    # If you have an evaluate function, call it here; placeholder:
-    await msg.edit_text("✅ Evaluation complete.")  # implement actual logic
+    msg = await update.message.reply_text("🕑 Running end-of-day exit checks…")
+    try:
+        await asyncio.to_thread(evaluate_job)
+        await msg.edit_text("✅ EOD checks complete.")
+    except Exception as e:
+        logging.error("Evaluation failed: %s", e)
+        await msg.edit_text(f"❌ Evaluation failed – {e}")
+
 
 @restricted
-async def retrain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🕑 Retraining all models… this may take a while.")
-    tickers = get_watchlist()
-    if not tickers:
-        return await msg.edit_text("📭 Your watchlist is empty. Add tickers with /add.")
+async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    init_db()
+    pos = list_positions()
+    if not pos:
+        return await update.message.reply_text("Position report: FLAT (no open positions).")
 
-    for ticker in tickers:
-        try:
-            # Retrain in a thread to avoid blocking
-            model = await asyncio.to_thread(
-                train_and_save_model,
-                *prepare_for_retrain(ticker)
-            )
-            await msg.reply_text(f"✅ Retrained model for {ticker}.")
-        except Exception as e:
-            logging.error("Retrain failed for %s: %s", ticker, e)
-            await msg.reply_text(f"❌ Retrain failed for {ticker}: {e}")
+    lines = ["Open positions:"]
+    for p in pos:
+        lines.append(
+            f"- {p['ticker']}: {p['state']} | shares={p['shares']} | "
+            f"entry={float(p['entry_px']):.2f} | stop={float(p['stop_px']):.2f} | "
+            f"target={float(p['target_px']):.2f} | hold={int(p['hold_days'])}/{int(p['horizon_days'])}"
+        )
+    await update.message.reply_text("\n".join(lines))
 
-def prepare_for_retrain(ticker: str):
-    """
-    Helper to load or prepare data for retraining.
-    Returns args for train_and_save_model.
-    """
-    # You may need to re-download & preprocess data here
-    from train.pipeline import download_data, prepare_data_and_split
-    df = download_data(ticker)
-    X_train, y_train, _, _, _, _ = prepare_data_and_split(df)
-    return (X_train, y_train, X_train.shape[1:], ticker)
 
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "🧠 *Available Commands:*\n\n"
-        "/forecast – Run model and send market predictions.\n"
-        "/evaluate – Compare today’s forecasts to actual prices.\n"
-        "/retrain – Retrain all models in your watchlist.\n"
+        "Available Commands:\n\n"
+        "/forecast – Run signals (BUY/WAIT/HOLD/SELL) for all watchlist tickers.\n"
+        "/evaluate – Run EOD exit checks (stop/target/time-stop).\n"
+        "/positions – Show open positions.\n"
         "/add TICKER – Add a stock ticker to your watchlist.\n"
         "/remove TICKER – Remove a stock from your watchlist.\n"
-        "/watchlist – Show all watched tickers.\n"
-        "/help – Show this message."
+        "/watchlist – Show your current watchlist.\n"
+        "/help – Show this message.\n\n"
+        "Note: This bot provides model-driven signals, not investment advice."
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(help_text)
+
 
 @restricted
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        return await update.message.reply_text("❗ Usage: /add TICKER")
+        return await update.message.reply_text("Usage: /add TICKER")
     ticker = context.args[0].upper()
     add_to_watchlist(ticker)
-    await update.message.reply_text(f"✅ Added `{ticker}` to your watchlist.", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Added {ticker} to your watchlist.")
+
 
 @restricted
 async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        return await update.message.reply_text("❗ Usage: /remove TICKER")
+        return await update.message.reply_text("Usage: /remove TICKER")
     ticker = context.args[0].upper()
     remove_from_watchlist(ticker)
-    await update.message.reply_text(f"🗑️ Removed `{ticker}` from your watchlist.", parse_mode="Markdown")
+    await update.message.reply_text(f"🗑️ Removed {ticker} from your watchlist.")
+
 
 @restricted
 async def list_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,18 +125,9 @@ async def list_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tickers:
         await update.message.reply_text("📭 Your watchlist is empty.")
     else:
-        formatted = "\n".join(f"• `{t}`" for t in tickers)
-        await update.message.reply_text(f"📋 *Your Watchlist:*\n{formatted}", parse_mode="Markdown")
+        formatted = "\n".join(f"• {t}" for t in tickers)
+        await update.message.reply_text(f"📋 Your Watchlist:\n{formatted}")
 
-@restricted
-async def validate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🕑 Running walk-forward validation for all tickers…")
-    try:
-        await asyncio.to_thread(walk_forward_job)
-        await msg.edit_text("✅ Walk-forward validation complete for all tickers.")
-    except Exception as e:
-        logging.error(f"Walk-forward validation failed: {e}")
-        await msg.edit_text(f"❌ Walk-forward validation failed: {e}")
 
 def main():
     init_db()
@@ -174,14 +135,14 @@ def main():
 
     app.add_handler(CommandHandler("forecast", forecast))
     app.add_handler(CommandHandler("evaluate", evaluate))
-    app.add_handler(CommandHandler("retrain", retrain))
+    app.add_handler(CommandHandler("positions", positions))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("watchlist", list_watchlist))
-    app.add_handler(CommandHandler("validate", validate))
 
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
