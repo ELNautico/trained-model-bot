@@ -18,3 +18,5 @@ logs/training/
 .cache/
 cache/
 /logs/*
+/backtests/*
+/models_signals/*
