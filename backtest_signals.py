@@ -680,6 +680,8 @@ def main() -> None:
     p.add_argument("--no-model-exit", action="store_true", help="Disable model-based exits (EV/p_stop), use barriers only")
 
     p.add_argument("--entry-min-ev", type=float, default=None, help="Override cfg.entry_min_ev")
+    p.add_argument("--exit-min-ev", type=float, default=None, help="Override cfg.exit_min_ev (model-based exit EV gate)")
+    p.add_argument("--exit-min-p-stop", type=float, default=None, help="Override cfg.exit_min_p_stop (model-based exit p_stop gate)")
 
     # Step C support: compute metrics on a holdout slice of the equity/trade stream
     p.add_argument("--metrics-start", type=str, default=None, help="Report metrics starting at this date (e.g. 2023-01-01)")
@@ -691,9 +693,19 @@ def main() -> None:
     args = p.parse_args()
 
     cfg = SignalConfig()
+
+    # Optional overrides (kept lightweight so backtests/sweeps can tune gates without editing config files)
+    overrides = {}
     if args.entry_min_ev is not None:
+        overrides["entry_min_ev"] = float(args.entry_min_ev)
+    if args.exit_min_ev is not None:
+        overrides["exit_min_ev"] = float(args.exit_min_ev)
+    if args.exit_min_p_stop is not None:
+        overrides["exit_min_p_stop"] = float(args.exit_min_p_stop)
+
+    if overrides:
         d = asdict(cfg)
-        d["entry_min_ev"] = float(args.entry_min_ev)
+        d.update(overrides)
         cfg = SignalConfig(**d)
 
     trades_df, equity_df = run_backtest(

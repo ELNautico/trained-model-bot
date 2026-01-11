@@ -270,6 +270,8 @@ def run_sweep(
     entry_min_evs: Sequence[float],
     retrain_everys: Sequence[int],
     lookbacks: Sequence[int],
+    exit_min_evs: Sequence[float],
+    exit_min_p_stops: Sequence[float],
     initial_cash: float,
     risk_per_trade: float,
     cooldown_days: int,
@@ -286,19 +288,21 @@ def run_sweep(
 
     cfg0 = SignalConfig()
 
-    combos = list(itertools.product(entry_min_evs, retrain_everys, lookbacks))
+    combos = list(itertools.product(entry_min_evs, retrain_everys, lookbacks, exit_min_evs, exit_min_p_stops))
     if not combos:
         raise ValueError("No parameter combinations to run. Check your sweep lists/ranges.")
 
     rows: List[Dict[str, Any]] = []
     total = len(combos)
 
-    for k, (ev, r_every, lb) in enumerate(combos, start=1):
-        print(f"[{k}/{total}] ev={ev} | retrain_every={r_every} | lookback={lb}")
+    for k, (ev, r_every, lb, exit_ev, exit_pstop) in enumerate(combos, start=1):
+        print(f"[{k}/{total}] entry_ev={ev} | exit_ev={exit_ev} | exit_pstop={exit_pstop} | retrain_every={r_every} | lookback={lb}")
 
         row: Dict[str, Any] = {
             "ticker": ticker,
             "entry_min_ev": float(ev),
+            "exit_min_ev": float(exit_ev),
+            "exit_min_p_stop": float(exit_pstop),
             "retrain_every": int(r_every),
             "lookback": int(lb),
             "status": "ok",
@@ -306,7 +310,10 @@ def run_sweep(
         }
 
         try:
-            cfg = set_cfg_field(cfg0, "entry_min_ev", float(ev))
+            cfg = SignalConfig(**asdict(cfg0))
+            cfg = set_cfg_field(cfg, "entry_min_ev", float(ev))
+            cfg = set_cfg_field(cfg, "exit_min_ev", float(exit_ev))
+            cfg = set_cfg_field(cfg, "exit_min_p_stop", float(exit_pstop))
 
             trades_df, equity_df = backtest_signals.run_backtest(
                 ticker,
@@ -378,7 +385,7 @@ def main() -> None:
     # Holdout evaluation window
     p.add_argument("--metrics-start", type=str, default=None, help="Holdout window start, e.g. 2024-01-01")
     p.add_argument("--metrics-end", type=str, default=None, help="Holdout window end, e.g. 2025-12-31")
-    p.add_argument("--min-holdout-trades", type=int, default=40, help="Minimum trades by exit in holdout window")
+    p.add_argument("--min-holdout-trades", type=int, default=20, help="Minimum trades by exit in holdout window")
 
     # Sweep parameters (required so you don't accidentally run an empty sweep)
     p.add_argument(
@@ -389,6 +396,10 @@ def main() -> None:
     )
     p.add_argument("--retrain-every", type=str, required=True, help="Comma list or range, e.g. 60,80,100 or 40:120:20")
     p.add_argument("--lookback", type=str, required=True, help="Comma list or range, e.g. 1200,1500,2000")
+
+    # Optional: sweep model-based exit gates as well (if omitted, use cfg defaults)
+    p.add_argument("--exit-min-ev", type=str, default=None, help="Comma list or range for cfg.exit_min_ev (model exit EV gate)")
+    p.add_argument("--exit-min-p-stop", type=str, default=None, help="Comma list or range for cfg.exit_min_p_stop (model exit p_stop gate)")
 
     # Portfolio assumptions (keep consistent while tuning model gates)
     p.add_argument("--initial-cash", type=float, default=100_000.0)
@@ -427,6 +438,20 @@ def main() -> None:
     retrain_everys = parse_value_list(args.retrain_every, cast=int)
     lookbacks = parse_value_list(args.lookback, cast=int)
 
+    # Optional exit-gate sweeps. If omitted, use the defaults from SignalConfig.
+    cfg_default = SignalConfig()
+    exit_min_evs = (
+        parse_value_list(args.exit_min_ev, cast=float)
+        if args.exit_min_ev is not None
+        else [float(getattr(cfg_default, "exit_min_ev"))]
+    )
+    exit_min_p_stops = (
+        parse_value_list(args.exit_min_p_stop, cast=float)
+        if args.exit_min_p_stop is not None
+        else [float(getattr(cfg_default, "exit_min_p_stop"))]
+    )
+
+
     df = run_sweep(
         args.ticker,
         start=args.start,
@@ -436,6 +461,8 @@ def main() -> None:
         entry_min_evs=entry_min_evs,
         retrain_everys=retrain_everys,
         lookbacks=lookbacks,
+        exit_min_evs=exit_min_evs,
+        exit_min_p_stops=exit_min_p_stops,
         initial_cash=float(args.initial_cash),
         risk_per_trade=float(args.risk),
         cooldown_days=int(args.cooldown),
@@ -459,6 +486,8 @@ def main() -> None:
     top_n = int(max(1, args.top))
     cols = [
         "entry_min_ev",
+        "exit_min_ev",
+        "exit_min_p_stop",
         "retrain_every",
         "lookback",
         "status",
@@ -490,10 +519,15 @@ def main() -> None:
                 continue
 
             ev = float(rec["entry_min_ev"])
+            exit_ev = float(rec.get("exit_min_ev", getattr(cfg0, "exit_min_ev")))
+            exit_pstop = float(rec.get("exit_min_p_stop", getattr(cfg0, "exit_min_p_stop")))
             r_every = int(rec["retrain_every"])
             lb = int(rec["lookback"])
 
-            cfg = set_cfg_field(cfg0, "entry_min_ev", ev)
+            cfg = SignalConfig(**asdict(cfg0))
+            cfg = set_cfg_field(cfg, "entry_min_ev", ev)
+            cfg = set_cfg_field(cfg, "exit_min_ev", exit_ev)
+            cfg = set_cfg_field(cfg, "exit_min_p_stop", exit_pstop)
 
             trades_df, equity_df = backtest_signals.run_backtest(
                 args.ticker,
@@ -509,7 +543,7 @@ def main() -> None:
             )
 
             # Deterministic file tag per config (Windows-safe)
-            cfg_tag = f"ev{ev:.3f}_r{r_every}_lb{lb}".replace(".", "p")
+            cfg_tag = f"ev{ev:.3f}_xev{exit_ev:.3f}_xp{exit_pstop:.3f}_r{r_every}_lb{lb}".replace(".", "p")
             if tag:
                 cfg_tag = f"{tag}_{cfg_tag}"
 

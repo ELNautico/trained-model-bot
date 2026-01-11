@@ -52,6 +52,7 @@ CACHE_TTL = timedelta(hours=24)
 MAX_RETURN_THRESHOLD = 0.50
 MAX_STALE_DAYS = 2
 PRUNE_PCT = 30                      # bottom X % features to drop
+ADJUSTMENT_MODE = "all"             # "all" or "split" or None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers ­– I/O
@@ -94,26 +95,17 @@ def _download_raw_ohlcv(ticker: str) -> pd.DataFrame:
             interval="1day",
             outputsize=5000,
             timezone="UTC",
-            adjustment="all",  # use adjusted data to avoid split/dividend jumps
+            adjustment=ADJUSTMENT_MODE,
         ).as_pandas()
     except TypeError:
-        # Some versions of twelvedata client don't accept 'adjustment' kwarg.
-        logging.warning("⚠️  TDClient.time_series doesn't support 'adjustment'; falling back to unadjusted data.")
-        df = td.time_series(
-            symbol=ticker,
-            interval="1day",
-            outputsize=5000,
-            timezone="UTC",
-        ).as_pandas()
-    if df.empty:
-        raise ValueError(f"Empty OHLCV for {ticker}")
-    df.columns = [c.capitalize() for c in df.columns]
-    df.index = pd.to_datetime(df.index, utc=True)
-    return df.sort_index()
+        logging.warning("⚠️  TDClient.time_series doesn't support 'adjustment'; using HTTP fallback with adjustment=%s", ADJUSTMENT_MODE)
+        df = _download_raw_ohlcv_http(ticker)
+        return df.sort_index()
 
 
 def cached_download(ticker: str) -> pd.DataFrame:
-    key = hashlib.md5(ticker.encode()).hexdigest()
+    cache_key = f"{ticker}|adj={ADJUSTMENT_MODE}"
+    key = hashlib.md5(cache_key.encode()).hexdigest()
     path = CACHE_DIR / f"{key}.pkl"
 
     if path.exists() and datetime.utcnow() - datetime.utcfromtimestamp(path.stat().st_mtime) < CACHE_TTL:
@@ -133,6 +125,39 @@ def cached_download(ticker: str) -> pd.DataFrame:
     df = df.drop(columns="ret")
 
     # Do not drop rows after long gaps; retain data and let models handle.
+    return df
+
+def _download_raw_ohlcv_http(ticker: str) -> pd.DataFrame:
+    import requests
+
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": ticker,
+        "interval": "1day",
+        "outputsize": 5000,
+        "timezone": "UTC",
+        "adjustment": ADJUSTMENT_MODE,
+        "apikey": api_key,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise ValueError(f"TwelveData error: {data.get('message')}")
+
+    values = data.get("values", [])
+    if not values:
+        raise ValueError(f"Empty OHLCV for {ticker} (HTTP fallback).")
+
+    df = pd.DataFrame(values)
+    # TwelveData commonly returns strings; normalize
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    df = df.set_index("datetime").sort_index()
+    df = df.rename(columns={
+        "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"
+    })
+    df = df[["Open","High","Low","Close","Volume"]].astype(float)
     return df
 
 # ─────────────────────────────────────────────────────────────────────────────
