@@ -1,0 +1,5 @@
+{
+  "name": "trained-model",
+  "private": true,
+  "workspaces": ["apps/*"]
+}

@@ -1,2 +1,10 @@
-from train.monitor import monitor_and_update_model
-monitor_and_update_model('^GSPC', iterations=1)
+"""Compatibility wrapper.
+
+The runtime entrypoint was moved to apps/main.py.
+"""
+
+from apps.main import main
+
+
+if __name__ == "__main__":
+    main()

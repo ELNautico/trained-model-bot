@@ -1,5 +1,5 @@
 from train.pipeline import train_predict_for_ticker, prepare_data_and_split, download_data
-from storage import get_watchlist, update_watchlist_timestamp, get_recent_errors
+from core.storage import get_watchlist, update_watchlist_timestamp, get_recent_errors
 from train.core import train_and_save_model
 from alert import send
 import logging

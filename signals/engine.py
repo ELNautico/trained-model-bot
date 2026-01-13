@@ -10,7 +10,7 @@ import numpy as np
 from signals.config import SignalConfig
 from signals.labeling import compute_barriers_from_row
 from signals.model import ensure_model
-from storage import (
+from core.storage import (
     get_position,
     upsert_position,
     close_position,

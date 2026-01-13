@@ -1,0 +1,11 @@
+# Copy this file to `config.toml` and fill in your credentials.
+# IMPORTANT: Never commit `config.toml` to source control.
+
+[twelvedata]
+# Twelve Data API key used by train/pipeline.py (download + caching)
+api_key = "PUT_YOUR_TWELVEDATA_API_KEY_HERE"
+
+[telegram]
+# Used by bot_listener.py (optional)
+token = "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE"
+chat_id = "PUT_YOUR_CHAT_ID_HERE"

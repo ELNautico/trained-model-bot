@@ -18,5 +18,9 @@ logs/training/
 .cache/
 cache/
 /logs/*
-/backtests/*
+/backtests
 /models_signals/*
+node_modules
+apps/api/dist/
+apps/dashboard/package.json
+package-lock.json
