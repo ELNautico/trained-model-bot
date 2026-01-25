@@ -229,8 +229,16 @@ def run_backtest(
     train_lookback_days: int = 2000,
     model_exit: bool = True,
     cooldown_days: int = 0,
+    slippage_model: str = "fixed",  # NEW: "fixed" or "spread_based"
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
+    Walk-forward backtest with slippage modeling.
+    
+    Args:
+        slippage_model: 
+            - "fixed": use next open + fixed slippage
+            - "spread_based": use historical open/close spread as proxy
+    
     Returns:
       trades_df, equity_df
     """
@@ -259,6 +267,39 @@ def run_backtest(
     if not feature_cols:
         raise ValueError("No feature columns inferred.")
 
+    # Helper: compute realistic entry price
+    def get_entry_price_with_slippage(idx: int) -> float:
+        """
+        Compute realistic entry price.
+        
+        Models:
+        - "fixed": use next open + fixed slippage
+        - "spread_based": use historical open/close spread as proxy
+        """
+        if slippage_model == "fixed":
+            # Use next bar's open + half the configured cost
+            if idx + 1 < len(df):
+                next_open = float(df.iloc[idx + 1]["Open"])
+                slippage = next_open * (cfg.one_way_cost_bps / 20000.0)
+                return next_open + slippage
+            else:
+                # Last bar: fallback to close + slippage
+                return float(closes[idx]) * (1.0 + cfg.one_way_cost_bps / 20000.0)
+        
+        elif slippage_model == "spread_based":
+            # Use historical open/close spread as slippage estimate
+            if idx + 1 < len(df):
+                next_open = float(df.iloc[idx + 1]["Open"])
+                # Add typical spread (use recent 20-bar avg of high-low spread)
+                recent_spreads = df.iloc[max(0, idx-20):idx+1]["High"] - df.iloc[max(0, idx-20):idx+1]["Low"]
+                avg_spread = float(recent_spreads.mean()) if len(recent_spreads) > 0 else 0.0
+                return next_open + avg_spread * 0.3  # assume you get 30% of spread
+            else:
+                return float(closes[idx]) * (1.0 + cfg.one_way_cost_bps / 10000.0)
+        
+        else:
+            raise ValueError(f"Unknown slippage_model: {slippage_model}")
+    
     # Arrays for speed
     highs = df["High"].to_numpy(dtype=float)
     lows = df["Low"].to_numpy(dtype=float)
@@ -458,16 +499,23 @@ def run_backtest(
 
                     if ev_net >= cfg.entry_min_ev:
                         eq = equity_at(i)
-                        sh = position_size_shares(eq, ep, sp, cfg, float(risk_per_trade))
+                        # FIXED: Use realistic entry price with slippage
+                        ep_realistic = get_entry_price_with_slippage(i)
+                        # Recompute levels with realistic entry
+                        sp_realistic, tp_realistic = compute_levels(ep_realistic, float(atrs[i]), cfg)
+                        
+                        sh = position_size_shares(eq, ep_realistic, sp_realistic, cfg, float(risk_per_trade))
                         if sh > 0:
-                            entry_notional = float(ep * sh)
+                            entry_notional = float(ep_realistic * sh)
                             entry_cost = apply_cost(entry_notional, cfg.one_way_cost_bps)
 
                             if cash >= entry_notional + entry_cost:
                                 cash -= entry_notional + entry_cost
 
                                 shares = int(sh)
-                                entry_px = float(ep)
+                                entry_px = float(ep_realistic)
+                                stop_px = float(sp_realistic)
+                                target_px = float(tp_realistic)
                                 stop_px = float(sp)
                                 target_px = float(tp)
                                 entry_i = int(i)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Dict, Optional, Tuple
 
@@ -177,6 +178,7 @@ def run_signal_cycle_for_ticker(
     account_balance: float,
     risk_per_trade: float,
     force_retrain: bool = False,
+    model_version: str = "ACTIVE",  # NEW: allow specifying version for A/B testing
 ) -> str:
     """
     Main daily loop for one ticker:
@@ -192,16 +194,29 @@ def run_signal_cycle_for_ticker(
     df.attrs["ticker"] = ticker
     df = enrich_features(df)
 
-    model = ensure_model(ticker, df, cfg, force_retrain=force_retrain)
+    # Load specific version if requested for A/B testing
+    if model_version != "ACTIVE":
+        from signals.model import SignalModelArtifact
+        model = SignalModelArtifact._load_from_dir(Path("models") / ticker / model_version)
+    else:
+        model = ensure_model(ticker, df, cfg, force_retrain=force_retrain)
     probs = model.predict_proba_last(df)
 
     pos = get_position(ticker)
 
-    # Barriers computed from the latest completed bar, using entry≈last close for messaging/sizing.
-    # If you later implement "execute next open" strictly, you'll need an orders table.
+    # Barriers computed from the latest completed bar
+    # FIXED: Use last close as reference, but actual entry would be next open + slippage
     decision_row = df.iloc[-1]
-    current_close = float(df["Close"].iloc[-1])
-    barriers = compute_barriers_from_row(decision_row, entry_px=current_close, cfg=cfg)
+    last_close = float(df["Close"].iloc[-1])
+    
+    # REALISTIC ENTRY PRICE: simulate next open + slippage
+    # In live trading, you'd use the actual next open; here we estimate
+    # Assume entry at last_close * (1 + slippage/2) as half-spread estimate
+    slippage_bps = cfg.one_way_cost_bps
+    entry_px_realistic = last_close * (1.0 + slippage_bps / 20000.0)  # half-spread estimate
+    
+    barriers = compute_barriers_from_row(decision_row, entry_px=entry_px_realistic, cfg=cfg)
+    current_close = last_close
 
     # Reward-risk and cost normalization
     R, cost_in_R = _reward_risk_and_cost_in_R(

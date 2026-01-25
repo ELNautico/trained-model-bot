@@ -454,6 +454,11 @@ def main() -> None:
     p.add_argument("--metrics-end", type=str, default=None, help="Holdout window end, e.g. 2025-12-31")
     p.add_argument("--min-holdout-trades", type=int, default=20, help="Minimum trades by exit in holdout window")
 
+    #Lockbox period 
+    p.add_argument("--lockbox-start", type=str, default=None, help="Final validation period start (never tuned on)")
+    p.add_argument("--lockbox-end", type=str, default=None, help="Final validation period end (never tuned on)")
+    p.add_argument("--lockbox-min-trades", type=int, default=10, help="Minimum trades required in lockbox for reporting")
+    
     p.add_argument("--entry-min-ev", type=str, required=True, help="Comma list or range start:stop:step")
     p.add_argument("--retrain-every", type=str, required=True, help="Comma list or range")
     p.add_argument("--lookback", type=str, required=True, help="Comma list or range")
@@ -569,6 +574,91 @@ def main() -> None:
 
     print("\nSaved sweep results (structured):")
     print(str(results_path))
+    
+        # NEW: Lockbox validation on best config (if specified)
+    if args.lockbox_start and args.lockbox_end:
+        print("\n" + "="*80)
+        print("LOCKBOX VALIDATION (pristine out-of-sample test)")
+        print("="*80)
+        
+        # Get best config that passed filters
+        best_ok = df[df["status"] == "ok"].head(1)
+        if best_ok.empty:
+            print("⚠️  No 'ok' configs to validate on lockbox.")
+        else:
+            best_rec = best_ok.iloc[0].to_dict()
+            
+            print(f"\nRe-running best config on lockbox period:")
+            print(f"  entry_min_ev: {best_rec['entry_min_ev']}")
+            print(f"  exit_min_ev: {best_rec.get('exit_min_ev')}")
+            print(f"  exit_min_p_stop: {best_rec.get('exit_min_p_stop')}")
+            print(f"  retrain_every: {best_rec['retrain_every']}")
+            print(f"  lookback: {best_rec['lookback']}")
+            print(f"  Lockbox window: {args.lockbox_start} to {args.lockbox_end}")
+            
+            cfg = SignalConfig(**asdict(SignalConfig()))
+            cfg = set_cfg_field(cfg, "entry_min_ev", float(best_rec["entry_min_ev"]))
+            cfg = set_cfg_field(cfg, "exit_min_ev", float(best_rec.get("exit_min_ev", cfg.exit_min_ev)))
+            cfg = set_cfg_field(cfg, "exit_min_p_stop", float(best_rec.get("exit_min_p_stop", cfg.exit_min_p_stop)))
+            
+            trades_df, equity_df = backtest_signals.run_backtest(
+                args.ticker,
+                cfg,
+                start=args.start,
+                end=args.end,
+                initial_cash=float(args.initial_cash),
+                risk_per_trade=float(args.risk),
+                retrain_every=int(best_rec["retrain_every"]),
+                train_lookback_days=int(best_rec["lookback"]),
+                model_exit=not bool(args.no_model_exit),
+                cooldown_days=int(args.cooldown),
+            )
+            
+            lockbox_start_ts = to_ts(args.lockbox_start)
+            lockbox_end_ts = to_ts(args.lockbox_end)
+            
+            lockbox_metrics = summarize_window(
+                trades_df,
+                equity_df,
+                initial_equity=float(args.initial_cash),
+                metrics_start=lockbox_start_ts,
+                metrics_end=lockbox_end_ts,
+            )
+            
+            lockbox_trades = int(lockbox_metrics.get("trades", 0))
+            
+            if lockbox_trades < int(args.lockbox_min_trades):
+                print(f"\n⚠️  Lockbox has only {lockbox_trades} trades (< {args.lockbox_min_trades} minimum).")
+                print("    Results are not statistically reliable.")
+            
+            print("\n📊 LOCKBOX METRICS (true out-of-sample performance):")
+            print(f"  Total return: {lockbox_metrics.get('total_return', 0)*100:.2f}%")
+            print(f"  Sharpe ratio: {lockbox_metrics.get('sharpe', 0):.3f}")
+            print(f"  Max drawdown: {lockbox_metrics.get('max_drawdown', 0)*100:.2f}%")
+            print(f"  Trades: {lockbox_trades}")
+            print(f"  Win rate: {lockbox_metrics.get('win_rate', 0)*100:.1f}%")
+            print(f"  Avg R-multiple: {lockbox_metrics.get('avg_r', 0):.3f}")
+            print(f"  Profit factor: {lockbox_metrics.get('profit_factor', 0):.2f}")
+            
+            # Save lockbox results
+            lockbox_path = rdir / "lockbox_validation.json"
+            write_meta(lockbox_path, {
+                "best_config": {
+                    "entry_min_ev": float(best_rec["entry_min_ev"]),
+                    "exit_min_ev": float(best_rec.get("exit_min_ev", cfg.exit_min_ev)),
+                    "exit_min_p_stop": float(best_rec.get("exit_min_p_stop", cfg.exit_min_p_stop)),
+                    "retrain_every": int(best_rec["retrain_every"]),
+                    "lookback": int(best_rec["lookback"]),
+                },
+                "lockbox_period": {
+                    "start": args.lockbox_start,
+                    "end": args.lockbox_end,
+                },
+                "lockbox_metrics": lockbox_metrics,
+                "warning": "LOW_SAMPLE" if lockbox_trades < args.lockbox_min_trades else None,
+            })
+            print(f"\n✅ Lockbox validation saved to: {lockbox_path}")
+
 
     # --- LEGACY flat output (default ON, so your current dashboard keeps showing runs) ---
     legacy_out_path = None

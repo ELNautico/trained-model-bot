@@ -45,6 +45,8 @@ class SignalConfig:
 
     # Risk sizing caps
     max_position_fraction: float = 0.25
+    
+    # One-way cost: commission + slippage (bid-ask spread + market impact)
     one_way_cost_bps: float = 5.0
 
     # Feature switches

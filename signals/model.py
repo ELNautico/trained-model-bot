@@ -382,12 +382,59 @@ def save_artifact(ticker: str, artifact: SignalModelArtifact, report: Dict):
         "report": report,
     }
     _meta_path(ticker).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    
+    # NEW: Create ACTIVE marker (use marker file for Windows compatibility)
+    # Note: models_signals/ uses flat structure, so ACTIVE just points to current
+    active_link = d / "ACTIVE"
+    try:
+        # Write marker file indicating this is the active version
+        import datetime
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        active_link.write_text(timestamp, encoding="utf-8")
+        logging.info(f"✅ Updated ACTIVE marker for {ticker}")
+    except Exception as e:
+        logging.warning(f"⚠️  Could not create ACTIVE marker: {e}")
 
 
 def load_artifact(ticker: str) -> SignalModelArtifact:
+    """
+    Load the ACTIVE model for a ticker.
+    Falls back to latest timestamp if ACTIVE doesn't exist.
+    """
+    model_base = Path("models_signals") / ticker.upper()
+    if not model_base.exists():
+        raise FileNotFoundError(f"No signal model directory for {ticker}")
+    
+    active_link = model_base / "ACTIVE"
+    
+    # Prefer ACTIVE symlink/marker
+    if active_link.exists() or active_link.is_symlink():
+        try:
+            if active_link.is_symlink():
+                version_dir = active_link.resolve()
+                if version_dir.exists():
+                    logging.info(f"📦 Loading ACTIVE model (symlink): {version_dir.name}")
+                    path = version_dir / "model.joblib"
+                    if path.exists():
+                        return joblib.load(path)
+            else:
+                # Marker file fallback (for Windows)
+                version_name = active_link.read_text(encoding="utf-8").strip()
+                version_dir = model_base / version_name
+                if version_dir.exists():
+                    logging.info(f"📦 Loading ACTIVE model (marker): {version_name}")
+                    path = version_dir / "model.joblib"
+                    if path.exists():
+                        return joblib.load(path)
+        except Exception as e:
+            logging.warning(f"⚠️ ACTIVE link exists but failed to load: {e}")
+    
+    # Fallback: use standard path (for backwards compatibility)
     path = _model_path(ticker)
     if not path.exists():
         raise FileNotFoundError(f"No signal model artifact at {path}")
+    
+    logging.warning(f"⚠️  ACTIVE link missing; using default path")
     return joblib.load(path)
 
 

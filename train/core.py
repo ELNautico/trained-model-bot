@@ -129,6 +129,25 @@ def train_and_save_model(
         json.dump(metadata, f, indent=4)
     print(f"📝 Saved metadata to {out_dir / 'metadata.json'}")
     print(f"✅ Saved ensemble to {out_dir}")
+    
+    # NEW: Create ACTIVE symlink pointing to latest version
+    model_base = Path("models") / ticker
+    active_link = model_base / "ACTIVE"
+    version_dir_name = ts  # timestamp from earlier
+    
+    # Remove old symlink if exists
+    if active_link.exists() or active_link.is_symlink():
+        active_link.unlink()
+    
+    # Create new symlink (relative, for portability)
+    try:
+        active_link.symlink_to(version_dir_name, target_is_directory=True)
+        print(f"✅ Updated ACTIVE symlink → {version_dir_name}")
+    except OSError as e:
+        # Windows may require admin rights; fallback to marker file
+        print(f"⚠️  Could not create symlink: {e}")
+        print("📝 Writing ACTIVE marker file instead")
+        active_link.write_text(version_dir_name, encoding="utf-8")
 
     # Feature sensitivity & pruning (save pruned features)
     from train.pipeline import save_pruned_features, build_sequences
@@ -191,18 +210,51 @@ def train_and_save_model(
 # ─────────────────────────────────────────────────────────────────────────────
 def load_model(ticker: str, *, version_timestamp: str | None = None) -> tf.keras.Model:
     """
-    Return the newest saved ensemble for `ticker` (or a specific timestamp
-    if `version_timestamp` is given).  Models are re-compiled so we don’t rely on
-    any legacy aliases such as 'mse'.
+    Load the ACTIVE model for a ticker (or specific version if provided).
+    Falls back to latest timestamp if ACTIVE doesn't exist.
     """
     base = Path("models") / ticker
+    
     if version_timestamp is None:
-        ts_pattern = re.compile(r"^\d{8}_\d{6}$")
-        versions = [d for d in base.iterdir() if d.is_dir() and ts_pattern.match(d.name)]
-        versions = sorted(versions, reverse=True)
-        if not versions:
-            raise FileNotFoundError(f"No model for {ticker}")
-        mdl_path = versions[0] / "model.h5"
+        # Try ACTIVE first
+        active_link = base / "ACTIVE"
+        
+        if active_link.exists() or active_link.is_symlink():
+            try:
+                if active_link.is_symlink():
+                    version_dir = active_link.resolve()
+                    mdl_path = version_dir / "model.h5"
+                    if mdl_path.exists():
+                        print(f"📦 Loading ACTIVE model (symlink): {version_dir.name}")
+                    else:
+                        raise FileNotFoundError(f"Model file not found at {mdl_path}")
+                else:
+                    # Marker file fallback (for Windows)
+                    version_name = active_link.read_text(encoding="utf-8").strip()
+                    mdl_path = base / version_name / "model.h5"
+                    if mdl_path.exists():
+                        print(f"📦 Loading ACTIVE model (marker): {version_name}")
+                    else:
+                        raise FileNotFoundError(f"Model file not found at {mdl_path}")
+            except Exception as e:
+                print(f"⚠️  ACTIVE link exists but failed to load: {e}")
+                # Fall through to timestamp search
+                ts_pattern = re.compile(r"^\d{8}_\d{6}$")
+                versions = [d for d in base.iterdir() if d.is_dir() and ts_pattern.match(d.name)]
+                versions = sorted(versions, reverse=True)
+                if not versions:
+                    raise FileNotFoundError(f"No model for {ticker}")
+                mdl_path = versions[0] / "model.h5"
+                print(f"⚠️  Using latest fallback: {versions[0].name}")
+        else:
+            # No ACTIVE, use latest timestamp
+            ts_pattern = re.compile(r"^\d{8}_\d{6}$")
+            versions = [d for d in base.iterdir() if d.is_dir() and ts_pattern.match(d.name)]
+            versions = sorted(versions, reverse=True)
+            if not versions:
+                raise FileNotFoundError(f"No model for {ticker}")
+            mdl_path = versions[0] / "model.h5"
+            print(f"⚠️  ACTIVE link missing; using latest: {versions[0].name}")
     else:
         mdl_path = base / version_timestamp / "model.h5"
 
