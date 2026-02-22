@@ -36,3 +36,10 @@ export type RunTopKItem = {
   tradesPath?: string;   // optional: relative/abs path for debugging
   equityPath?: string;   // optional: relative/abs path for debugging
 };
+
+/** One data point from equity.csv */
+export type EquityPoint = {
+  date: string;
+  equity: number;
+  action: string | null;
+};

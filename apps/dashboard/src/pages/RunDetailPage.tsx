@@ -16,12 +16,13 @@ import {
   Title,
   Radio,
 } from '@mantine/core';
-import { IconDownload, IconInfoCircle } from '@tabler/icons-react';
+import { IconChartLine, IconDownload, IconInfoCircle } from '@tabler/icons-react';
 import MetricsLegend from '../components/MetricsLegend';
 import { api, safe } from '../lib/api';
 import { fmtInt, fmtNum, fmtPct, fmtDate } from '../lib/format';
 import MetricCard from '../components/MetricCard';
-import type { RunDetail, RunTopKItem } from '../types/runs';
+import EquityCurveChart from '../components/EquityCurveChart';
+import type { RunDetail, RunTopKItem, EquityPoint } from '../types/runs';
 import ConfigCommandDrawer from '../components/ConfigCommandDrawer';
 
 type SortKey =
@@ -67,6 +68,13 @@ export default function RunDetailPage() {
   // Optional Top-K artifacts (only if backend endpoint exists)
   const [topk, setTopk] = useState<RunTopKItem[]>([]);
 
+  // Equity curve for backtest runs
+  const [equityCurve, setEquityCurve] = useState<EquityPoint[] | null>(null);
+
+  // Per-rank equity curves for top-K artifacts (rank → data)
+  const [topkEquity, setTopkEquity] = useState<Record<number, EquityPoint[]>>({});
+  const [topkEquityLoading, setTopkEquityLoading] = useState<Record<number, boolean>>({});
+
   useEffect(() => {
     if (!runId) return;
 
@@ -81,9 +89,18 @@ export default function RunDetailPage() {
       setPage(1);
       setSelectedIdx(null);
       setDrawerOpen(false);
+      setEquityCurve(null);
+      setTopkEquity({});
+      setTopkEquityLoading({});
+
+      // For backtest runs, auto-fetch equity curve
+      if (d?.run?.kind === ‘backtest’) {
+        const eq = await safe<EquityPoint[]>(api.getEquityCurve(runId), ‘Failed to load equity curve’);
+        setEquityCurve(eq ?? null);
+      }
 
       // Try loading top-k; if endpoint isn’t present, safe() returns null and we keep empty
-      const tk = await safe<RunTopKItem[]>(api.listTopK(runId), 'Failed to load top-k artifacts');
+      const tk = await safe<RunTopKItem[]>(api.listTopK(runId), ‘Failed to load top-k artifacts’);
       setTopk(tk ?? []);
     })();
   }, [runId]);
@@ -234,6 +251,18 @@ export default function RunDetailPage() {
           <MetricCard label="Best holdout trades" value={fmtInt(best?.holdoutTrades)} />
         </SimpleGrid>
 
+        {/* Equity curve — auto-shown for backtest runs */}
+        {equityCurve !== null ? (
+          <Card withBorder radius="md" p="md">
+            <Group mb="sm">
+              <IconChartLine size={18} />
+              <Title order={4} style={{ margin: 0 }}>Equity Curve</Title>
+              <Text c="dimmed" size="sm">Portfolio value over time · initial ${(100_000).toLocaleString()}</Text>
+            </Group>
+            <EquityCurveChart data={equityCurve} initialEquity={100_000} height={300} />
+          </Card>
+        ) : null}
+
         {topk.length > 0 ? (
           <Card withBorder radius="md" p="md">
             <Group justify="space-between" align="end">
@@ -245,34 +274,76 @@ export default function RunDetailPage() {
               </div>
             </Group>
 
-            <Stack gap="xs" mt="sm">
-              {topk.map((x) => (
-                <Group key={x.rank} justify="space-between" wrap="nowrap">
-                  <Text fw={600}>Rank {x.rank}</Text>
-                  <Group gap="xs">
-                    <Button
-                      variant="light"
-                      size="xs"
-                      leftSection={<IconDownload size={14} />}
-                      component="a"
-                      href={api.downloadTopKCsvUrl(run.runId, x.rank, 'trades')}
-                      disabled={!x.hasTrades}
-                    >
-                      trades.csv
-                    </Button>
-                    <Button
-                      variant="light"
-                      size="xs"
-                      leftSection={<IconDownload size={14} />}
-                      component="a"
-                      href={api.downloadTopKCsvUrl(run.runId, x.rank, 'equity')}
-                      disabled={!x.hasEquity}
-                    >
-                      equity.csv
-                    </Button>
-                  </Group>
-                </Group>
-              ))}
+            <Stack gap="md" mt="sm">
+              {topk.map((x) => {
+                const chartData = topkEquity[x.rank];
+                const isLoading = topkEquityLoading[x.rank] ?? false;
+                const chartVisible = chartData !== undefined;
+
+                return (
+                  <div key={x.rank}>
+                    <Group justify="space-between" wrap="nowrap">
+                      <Text fw={600}>Rank {x.rank}</Text>
+                      <Group gap="xs">
+                        {x.hasEquity ? (
+                          <Button
+                            variant={chartVisible ? 'filled' : 'light'}
+                            size="xs"
+                            leftSection={<IconChartLine size={14} />}
+                            loading={isLoading}
+                            onClick={async () => {
+                              if (chartVisible) {
+                                // toggle off
+                                setTopkEquity((prev) => {
+                                  const next = { ...prev };
+                                  delete next[x.rank];
+                                  return next;
+                                });
+                                return;
+                              }
+                              setTopkEquityLoading((prev) => ({ ...prev, [x.rank]: true }));
+                              const eq = await safe<EquityPoint[]>(
+                                api.getTopKEquityCurve(run.runId, x.rank),
+                                `Failed to load chart for rank ${x.rank}`,
+                              );
+                              setTopkEquityLoading((prev) => ({ ...prev, [x.rank]: false }));
+                              if (eq) setTopkEquity((prev) => ({ ...prev, [x.rank]: eq }));
+                            }}
+                          >
+                            {chartVisible ? 'Hide chart' : 'View chart'}
+                          </Button>
+                        ) : null}
+                        <Button
+                          variant="light"
+                          size="xs"
+                          leftSection={<IconDownload size={14} />}
+                          component="a"
+                          href={api.downloadTopKCsvUrl(run.runId, x.rank, 'trades')}
+                          disabled={!x.hasTrades}
+                        >
+                          trades.csv
+                        </Button>
+                        <Button
+                          variant="light"
+                          size="xs"
+                          leftSection={<IconDownload size={14} />}
+                          component="a"
+                          href={api.downloadTopKCsvUrl(run.runId, x.rank, 'equity')}
+                          disabled={!x.hasEquity}
+                        >
+                          equity.csv
+                        </Button>
+                      </Group>
+                    </Group>
+
+                    {chartVisible ? (
+                      <div style={{ marginTop: 12 }}>
+                        <EquityCurveChart data={chartData} initialEquity={100_000} height={240} />
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
             </Stack>
           </Card>
         ) : null}

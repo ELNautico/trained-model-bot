@@ -43,3 +43,9 @@ export type RunTopKItem = {
   hasTrades: boolean;
   hasEquity: boolean;
 };
+
+export type EquityPoint = {
+  date: string;
+  equity: number;
+  action: string | null;
+};

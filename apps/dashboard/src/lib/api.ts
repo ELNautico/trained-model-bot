@@ -1,5 +1,5 @@
 import { notifications } from '@mantine/notifications';
-import type { RunDetail, RunSummary, RunTopKItem } from '../types/runs';
+import type { RunDetail, RunSummary, RunTopKItem, EquityPoint } from '../types/runs';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '/api';
 
@@ -37,6 +37,12 @@ export const api = {
   getRun: (runId: string) => fetchJson<RunDetail>(apiUrl(`/runs/${encodeURIComponent(runId)}`)),
 
   downloadRunCsvUrl: (runId: string) => apiUrl(`/runs/${encodeURIComponent(runId)}/download`),
+
+  // Equity curves (JSON)
+  getEquityCurve: (runId: string) =>
+    fetchJson<EquityPoint[]>(apiUrl(`/runs/${encodeURIComponent(runId)}/equity-json`)),
+  getTopKEquityCurve: (runId: string, rank: number) =>
+    fetchJson<EquityPoint[]>(apiUrl(`/runs/${encodeURIComponent(runId)}/topk/${encodeURIComponent(String(rank))}/equity-json`)),
 
   // Top-K
   listTopK: (runId: string) => fetchJson<RunTopKItem[]>(apiUrl(`/runs/${encodeURIComponent(runId)}/topk`)),

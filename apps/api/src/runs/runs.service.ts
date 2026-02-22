@@ -3,7 +3,7 @@ import { parse } from 'csv-parse/sync';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
-import { RunDetail, RunSummary, RunTopKItem, RunMeta } from './runs.types';
+import { RunDetail, RunSummary, RunTopKItem, RunMeta, EquityPoint } from './runs.types';
 
 function toNumberOrNull(v: unknown): number | null {
   if (v === null || v === undefined) return null;
@@ -392,6 +392,49 @@ export class RunsService {
 
     items.sort((a, b) => a.rank - b.rank);
     return items;
+  }
+
+  // -------------------- Equity curves (JSON) --------------------
+
+  private parseEquityCsv(content: string): EquityPoint[] {
+    const { rows } = this.parseCsv(content);
+    return rows
+      .map((r) => ({
+        date: (r['date'] ?? '').toString().trim(),
+        equity: toNumberOrNull(r['equity']) ?? 0,
+        action: r['action'] ? r['action'].toString().trim() : null,
+      }))
+      .filter((p) => p.date && p.equity > 0);
+  }
+
+  async getEquityCurve(runId: string): Promise<EquityPoint[]> {
+    const runDir = this.safeResolveRunDir(runId);
+    const equityPath = path.resolve(runDir, 'equity.csv');
+    if (!fs.existsSync(equityPath)) throw new NotFoundException('equity.csv not found for this run');
+
+    const content = await fsp.readFile(equityPath, 'utf-8');
+    return this.parseEquityCsv(content);
+  }
+
+  async getTopKEquityCurve(runId: string, rank: string): Promise<EquityPoint[]> {
+    if (!/^\d+$/.test(rank)) throw new BadRequestException('Invalid rank');
+
+    const runDir = this.safeResolveRunDir(runId);
+    const topkDir = path.resolve(runDir, 'topk');
+    if (!fs.existsSync(topkDir)) throw new NotFoundException('TopK not found');
+
+    const entries = await fsp.readdir(topkDir, { withFileTypes: true });
+    const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+
+    const want = String(rank).padStart(2, '0');
+    const match = dirs.find((d) => d.toLowerCase().startsWith(`rank${want}__`));
+    if (!match) throw new NotFoundException('Rank not found');
+
+    const equityPath = path.resolve(topkDir, match, 'equity.csv');
+    if (!fs.existsSync(equityPath)) throw new NotFoundException('equity.csv not found for this rank');
+
+    const content = await fsp.readFile(equityPath, 'utf-8');
+    return this.parseEquityCsv(content);
   }
 
   async streamTopKCsv(
