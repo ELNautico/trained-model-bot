@@ -660,6 +660,17 @@ def main() -> None:
     p.add_argument("--lookback", type=int, default=2000)
     p.add_argument("--cooldown", type=int, default=0)
     p.add_argument("--no-model-exit", action="store_true")
+    p.add_argument(
+        "--slippage-model",
+        type=str,
+        default="fixed",
+        choices=["fixed", "spread_based"],
+        help=(
+            "Slippage model for entry price simulation. "
+            "'fixed': next open + half the configured cost in bps (default). "
+            "'spread_based': next open + 30%% of the recent 20-bar high-low spread."
+        ),
+    )
 
     p.add_argument("--entry-min-ev", type=float, default=None)
     p.add_argument("--exit-min-ev", type=float, default=None)
@@ -699,6 +710,7 @@ def main() -> None:
         train_lookback_days=int(args.lookback),
         model_exit=not bool(args.no_model_exit),
         cooldown_days=int(args.cooldown),
+        slippage_model=args.slippage_model,
     )
 
     backtests_dir = Path(args.out_dir)
@@ -728,6 +740,7 @@ def main() -> None:
             "cwd": os.getcwd(),
             "cli": vars(args),
             "cfg_overrides": overrides,
+            "slippage_model": args.slippage_model,
         },
     )
 
