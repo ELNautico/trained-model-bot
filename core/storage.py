@@ -98,6 +98,35 @@ CREATE TABLE IF NOT EXISTS trades (
   pnl REAL,
   return_pct REAL
 );
+
+-- Paper-trading (dry-run) mirrors: same schema, no real capital at risk
+CREATE TABLE IF NOT EXISTS paper_positions (
+  ticker TEXT PRIMARY KEY,
+  state TEXT,
+  entry_ts TEXT,
+  entry_px REAL,
+  shares INTEGER,
+  stop_px REAL,
+  target_px REAL,
+  horizon_days INTEGER,
+  hold_days INTEGER,
+  last_update_ts TEXT
+);
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT,
+  ticker TEXT,
+  side TEXT,
+  entry_ts TEXT,
+  entry_px REAL,
+  exit_ts TEXT,
+  exit_px REAL,
+  shares INTEGER,
+  reason TEXT,
+  pnl REAL,
+  return_pct REAL
+);
 """
 
 
@@ -281,6 +310,78 @@ def save_trade(row: Dict[str, Any]) -> None:
         c.execute(
             """
             INSERT INTO trades
+            (ts, ticker, side, entry_ts, entry_px, exit_ts, exit_px, shares, reason, pnl, return_pct)
+            VALUES
+            (:ts, :ticker, :side, :entry_ts, :entry_px, :exit_ts, :exit_px, :shares, :reason, :pnl, :return_pct)
+            """,
+            payload
+        )
+
+
+# --------------------------------------------------------------------------------------
+# Paper-trading (dry-run) storage — identical schema to real positions/trades
+# --------------------------------------------------------------------------------------
+
+_POSITION_KEYS = [
+    "ticker", "state", "entry_ts", "entry_px", "shares", "stop_px", "target_px",
+    "horizon_days", "hold_days", "last_update_ts"
+]
+
+
+def get_paper_position(ticker: str) -> Optional[Dict[str, Any]]:
+    with _conn() as c:
+        row = c.execute(
+            """
+            SELECT ticker, state, entry_ts, entry_px, shares, stop_px, target_px,
+                   horizon_days, hold_days, last_update_ts
+            FROM paper_positions WHERE ticker = ?
+            """,
+            (ticker.upper(),)
+        ).fetchone()
+    return dict(zip(_POSITION_KEYS, row)) if row else None
+
+
+def upsert_paper_position(pos: Dict[str, Any]) -> None:
+    payload = dict(pos)
+    payload["ticker"] = payload["ticker"].upper()
+    with _conn() as c:
+        c.execute(
+            """
+            INSERT OR REPLACE INTO paper_positions
+            (ticker, state, entry_ts, entry_px, shares, stop_px, target_px,
+             horizon_days, hold_days, last_update_ts)
+            VALUES
+            (:ticker, :state, :entry_ts, :entry_px, :shares, :stop_px, :target_px,
+             :horizon_days, :hold_days, :last_update_ts)
+            """,
+            payload
+        )
+
+
+def close_paper_position(ticker: str) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM paper_positions WHERE ticker = ?", (ticker.upper(),))
+
+
+def list_paper_positions() -> List[Dict[str, Any]]:
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT ticker, state, entry_ts, entry_px, shares, stop_px, target_px,
+                   horizon_days, hold_days, last_update_ts
+            FROM paper_positions ORDER BY ticker ASC
+            """
+        ).fetchall()
+    return [dict(zip(_POSITION_KEYS, r)) for r in rows]
+
+
+def save_paper_trade(row: Dict[str, Any]) -> None:
+    payload = dict(row)
+    payload["ticker"] = payload["ticker"].upper()
+    with _conn() as c:
+        c.execute(
+            """
+            INSERT INTO paper_trades
             (ts, ticker, side, entry_ts, entry_px, exit_ts, exit_px, shares, reason, pnl, return_pct)
             VALUES
             (:ts, :ticker, :side, :entry_ts, :entry_px, :exit_ts, :exit_px, :shares, :reason, :pnl, :return_pct)

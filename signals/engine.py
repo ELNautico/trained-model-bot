@@ -17,6 +17,10 @@ from core.storage import (
     close_position,
     save_signal,
     save_trade,
+    get_paper_position,
+    upsert_paper_position,
+    close_paper_position,
+    save_paper_trade,
 )
 from train.pipeline import download_data  # your cached OHLCV download
 from core.features import enrich_features
@@ -178,7 +182,8 @@ def run_signal_cycle_for_ticker(
     account_balance: float,
     risk_per_trade: float,
     force_retrain: bool = False,
-    model_version: str = "ACTIVE",  # NEW: allow specifying version for A/B testing
+    model_version: str = "ACTIVE",
+    dry_run: bool = False,
 ) -> str:
     """
     Main daily loop for one ticker:
@@ -189,7 +194,17 @@ def run_signal_cycle_for_ticker(
       5) Apply FLAT/LONG state machine; possibly open/close position
       6) Persist signal and trades
       7) Return a human-readable message
+
+    dry_run=True: paper-trading mode — all analysis runs normally, but
+      positions and trades are stored in the paper_* tables only.
+      No real capital is committed.  Message is prefixed with [PAPER].
     """
+    # Dispatch to real or paper storage depending on mode
+    _get_pos    = get_paper_position    if dry_run else get_position
+    _upsert_pos = upsert_paper_position if dry_run else upsert_position
+    _close_pos  = close_paper_position  if dry_run else close_position
+    _save_trd   = save_paper_trade      if dry_run else save_trade
+
     df = download_data(ticker)
     df.attrs["ticker"] = ticker
     df = enrich_features(df)
@@ -202,7 +217,7 @@ def run_signal_cycle_for_ticker(
         model = ensure_model(ticker, df, cfg, force_retrain=force_retrain)
     probs = model.predict_proba_last(df)
 
-    pos = get_position(ticker)
+    pos = _get_pos(ticker)
 
     # Barriers computed from the latest completed bar
     # FIXED: Use last close as reference, but actual entry would be next open + slippage
@@ -271,7 +286,7 @@ def run_signal_cycle_for_ticker(
             action = "WAIT"
             rationale = "Sizing yielded 0 shares (risk too small vs stop distance)."
         else:
-            upsert_position({
+            _upsert_pos({
                 "ticker": ticker.upper(),
                 "state": "LONG",
                 "entry_ts": ts,
@@ -292,7 +307,7 @@ def run_signal_cycle_for_ticker(
         pnl = float((exit_px - entry_px) * shares)
         ret = float((exit_px / entry_px - 1.0) if entry_px > 0 else 0.0)
 
-        save_trade({
+        _save_trd({
             "ts": ts,
             "ticker": ticker.upper(),
             "side": "LONG",
@@ -305,7 +320,7 @@ def run_signal_cycle_for_ticker(
             "pnl": pnl,
             "return_pct": ret * 100.0,
         })
-        close_position(ticker)
+        _close_pos(ticker)
 
     # Build message
     ts_local = df.index[-1].tz_convert(ZoneInfo("Europe/Vienna")) if getattr(df.index[-1], "tz", None) else df.index[-1]
@@ -329,7 +344,7 @@ def run_signal_cycle_for_ticker(
     )
 
     # Position summary
-    pos2 = get_position(ticker)
+    pos2 = _get_pos(ticker)
     if pos2 is None:
         msg += "\n\nPosition: FLAT"
     else:
@@ -342,10 +357,13 @@ def run_signal_cycle_for_ticker(
             f"  Hold days: {int(pos2.get('hold_days', 0))}/{int(pos2.get('horizon_days', cfg.horizon_days))}"
         )
 
+    if dry_run:
+        msg = "[PAPER] " + msg
+
     return msg
 
 
-def run_eod_position_checks(ticker: str) -> Optional[str]:
+def run_eod_position_checks(ticker: str, *, dry_run: bool = False) -> Optional[str]:
     """
     End-of-day "hard exit" checks for open positions:
       - stop-loss hit
@@ -354,8 +372,15 @@ def run_eod_position_checks(ticker: str) -> Optional[str]:
 
     Conservative OHLC handling:
       - If both stop and target touched in same day, treat it as stop first.
+
+    dry_run=True: checks paper_positions table, logs to paper_trades.
     """
-    pos = get_position(ticker)
+    _get_pos    = get_paper_position    if dry_run else get_position
+    _upsert_pos = upsert_paper_position if dry_run else upsert_position
+    _close_pos  = close_paper_position  if dry_run else close_position
+    _save_trd   = save_paper_trade      if dry_run else save_trade
+
+    pos = _get_pos(ticker)
     if pos is None or pos.get("state") != "LONG":
         return None
 
@@ -393,7 +418,7 @@ def run_eod_position_checks(ticker: str) -> Optional[str]:
         pnl = float((exit_px - entry_px) * shares)
         ret = float((exit_px / entry_px - 1.0) if entry_px > 0 else 0.0)
 
-        save_trade({
+        _save_trd({
             "ts": ts,
             "ticker": ticker.upper(),
             "side": "LONG",
@@ -406,16 +431,17 @@ def run_eod_position_checks(ticker: str) -> Optional[str]:
             "pnl": pnl,
             "return_pct": ret * 100.0,
         })
-        close_position(ticker)
+        _close_pos(ticker)
+        prefix = "[PAPER] " if dry_run else ""
         return (
-            f"{ticker.upper()} EXIT ({ts})\n"
+            f"{prefix}{ticker.upper()} EXIT ({ts})\n"
             f"Reason: {exit_reason}\n"
             f"Exit px: {exit_px:.2f}\n"
             f"PnL: {pnl:.2f} ({ret*100.0:.2f}%)"
         )
 
     # Persist hold-day update (still LONG)
-    upsert_position({
+    _upsert_pos({
         "ticker": ticker.upper(),
         "state": "LONG",
         "entry_ts": pos.get("entry_ts"),
