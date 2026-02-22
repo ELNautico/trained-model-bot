@@ -24,3 +24,6 @@ node_modules
 apps/api/dist/
 apps/dashboard/package.json
 package-lock.json
+./claude
+CLAUDE.md
+.gitignore

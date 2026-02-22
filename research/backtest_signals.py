@@ -516,8 +516,6 @@ def run_backtest(
                                 entry_px = float(ep_realistic)
                                 stop_px = float(sp_realistic)
                                 target_px = float(tp_realistic)
-                                stop_px = float(sp)
-                                target_px = float(tp)
                                 entry_i = int(i)
                                 hold_days = 0
 
