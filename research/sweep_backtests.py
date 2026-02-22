@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 
 # --- robust import (works when run as script from repo root, and also as package) ---
 try:
@@ -325,6 +326,96 @@ def objective_value(row: Dict[str, Any], objective: str) -> float:
 
 
 # -----------------------------------------------------------------------------
+# Module-level worker — must be at module scope so joblib/loky can pickle it.
+# All arguments are plain Python scalars / dicts / strings (no DataFrames,
+# no Timestamps) so they serialise cleanly across process boundaries.
+# -----------------------------------------------------------------------------
+def _run_single_config(
+    k: int,
+    total: int,
+    ticker: str,
+    ev: float,
+    r_every: int,
+    lb: int,
+    exit_ev: float,
+    exit_pstop: float,
+    cfg0_dict: Dict[str, Any],
+    start: Optional[str],
+    end: Optional[str],
+    initial_cash: float,
+    risk_per_trade: float,
+    model_exit: bool,
+    cooldown_days: int,
+    metrics_start_str: Optional[str],
+    metrics_end_str: Optional[str],
+    min_holdout_trades: int,
+    objective: str,
+    verbose: bool,
+) -> Dict[str, Any]:
+    """Run one (ticker, config) pair and return a result-row dict."""
+    if verbose:
+        print(
+            f"[{k}/{total}] entry_ev={ev} | exit_ev={exit_ev} | "
+            f"exit_pstop={exit_pstop} | retrain_every={r_every} | lookback={lb}"
+        )
+
+    ms = to_ts(metrics_start_str) if metrics_start_str else None
+    me = to_ts(metrics_end_str) if metrics_end_str else None
+
+    row: Dict[str, Any] = {
+        "ticker": ticker,
+        "entry_min_ev": float(ev),
+        "exit_min_ev": float(exit_ev),
+        "exit_min_p_stop": float(exit_pstop),
+        "retrain_every": int(r_every),
+        "lookback": int(lb),
+        "status": "ok",
+        "error": None,
+    }
+
+    try:
+        cfg = SignalConfig(**cfg0_dict)
+        cfg = set_cfg_field(cfg, "entry_min_ev", float(ev))
+        cfg = set_cfg_field(cfg, "exit_min_ev", float(exit_ev))
+        cfg = set_cfg_field(cfg, "exit_min_p_stop", float(exit_pstop))
+
+        trades_df, equity_df = backtest_signals.run_backtest(
+            ticker,
+            cfg,
+            start=start,
+            end=end,
+            initial_cash=float(initial_cash),
+            risk_per_trade=float(risk_per_trade),
+            retrain_every=int(r_every),
+            train_lookback_days=int(lb),
+            model_exit=bool(model_exit),
+            cooldown_days=int(cooldown_days),
+        )
+
+        full = summarize_window(trades_df, equity_df, initial_equity=float(initial_cash))
+        hold = summarize_window(trades_df, equity_df, metrics_start=ms, metrics_end=me)
+
+        for kk, vv in full.items():
+            row[f"full_{kk}"] = vv
+        for kk, vv in hold.items():
+            row[f"holdout_{kk}"] = vv
+
+        hold_trades = int(row.get("holdout_trades", 0) or 0)
+        if hold_trades < int(min_holdout_trades):
+            row["status"] = "filtered_min_trades"
+
+        obj = objective_value(row, objective)
+        row["objective"] = float(obj) if np.isfinite(obj) else -1e9
+
+    except Exception as e:
+        row["status"] = "error"
+        row["error"] = repr(e)
+        row["objective"] = -1e12
+
+    return row
+
+
+# -----------------------------------------------------------------------------
 # Sweep runner
 # -----------------------------------------------------------------------------
 def run_sweep(
@@ -345,88 +436,87 @@ def run_sweep(
     model_exit: bool,
     objective: str,
     min_holdout_trades: int,
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """
     Execute the grid search and return a results DataFrame.
+
+    Args:
+        n_jobs: Number of parallel workers (passed to joblib.Parallel).
+                1  = sequential (default, identical to previous behaviour).
+                -1 = use all available CPU cores.
+                N  = use exactly N cores.
     """
     ticker = ticker.upper()
-    ms = to_ts(metrics_start)
-    me = to_ts(metrics_end)
 
-    cfg0 = SignalConfig()
+    cfg0_dict = asdict(SignalConfig())
 
     combos = list(itertools.product(entry_min_evs, retrain_everys, lookbacks, exit_min_evs, exit_min_p_stops))
     if not combos:
         raise ValueError("No parameter combinations to run. Check your sweep lists/ranges.")
 
-    rows: List[Dict[str, Any]] = []
     total = len(combos)
 
-    for k, (ev, r_every, lb, exit_ev, exit_pstop) in enumerate(combos, start=1):
-        print(
-            f"[{k}/{total}] entry_ev={ev} | exit_ev={exit_ev} | exit_pstop={exit_pstop} | retrain_every={r_every} | lookback={lb}"
+    # ------------------------------------------------------------------
+    # Pre-warm the OHLCV cache in the MAIN process before forking.
+    # This ensures every worker reads from disk rather than hitting the
+    # TwelveData API simultaneously (avoids rate-limit errors and
+    # redundant network round-trips).
+    # ------------------------------------------------------------------
+    try:
+        from train.pipeline import download_data
+        print(f"Pre-warming data cache for {ticker}…")
+        download_data(ticker)
+        print("Cache ready.")
+    except Exception as exc:
+        print(f"Cache pre-warm failed ({exc}); workers will fetch data individually.")
+
+    # ------------------------------------------------------------------
+    # Shared keyword args for every worker call (avoids repetition)
+    # ------------------------------------------------------------------
+    shared: Dict[str, Any] = dict(
+        ticker=ticker,
+        cfg0_dict=cfg0_dict,
+        start=start,
+        end=end,
+        initial_cash=float(initial_cash),
+        risk_per_trade=float(risk_per_trade),
+        model_exit=bool(model_exit),
+        cooldown_days=int(cooldown_days),
+        metrics_start_str=metrics_start,
+        metrics_end_str=metrics_end,
+        min_holdout_trades=int(min_holdout_trades),
+        objective=objective,
+    )
+
+    if n_jobs == 1:
+        # ── Sequential (original behaviour, per-config progress prints) ──
+        rows: List[Dict[str, Any]] = []
+        for k, (ev, r_every, lb, exit_ev, exit_pstop) in enumerate(combos, start=1):
+            row = _run_single_config(
+                k, total, ev=ev, r_every=r_every, lb=lb,
+                exit_ev=exit_ev, exit_pstop=exit_pstop,
+                verbose=True, **shared,
+            )
+            rows.append(row)
+    else:
+        # ── Parallel (joblib loky backend — spawned processes, GIL-free) ──
+        effective = n_jobs if n_jobs > 0 else "all"
+        print(f"\nRunning {total} configs in parallel (n_jobs={effective})…")
+
+        rows = Parallel(n_jobs=n_jobs, backend="loky", verbose=0)(
+            delayed(_run_single_config)(
+                k, total, ev=ev, r_every=r_every, lb=lb,
+                exit_ev=exit_ev, exit_pstop=exit_pstop,
+                verbose=False, **shared,
+            )
+            for k, (ev, r_every, lb, exit_ev, exit_pstop) in enumerate(combos, start=1)
         )
 
-        row: Dict[str, Any] = {
-            "ticker": ticker,
-            "entry_min_ev": float(ev),
-            "exit_min_ev": float(exit_ev),
-            "exit_min_p_stop": float(exit_pstop),
-            "retrain_every": int(r_every),
-            "lookback": int(lb),
-            "status": "ok",
-            "error": None,
-        }
-
-        try:
-            cfg = SignalConfig(**asdict(cfg0))
-            cfg = set_cfg_field(cfg, "entry_min_ev", float(ev))
-            cfg = set_cfg_field(cfg, "exit_min_ev", float(exit_ev))
-            cfg = set_cfg_field(cfg, "exit_min_p_stop", float(exit_pstop))
-
-            trades_df, equity_df = backtest_signals.run_backtest(
-                ticker,
-                cfg,
-                start=start,
-                end=end,
-                initial_cash=float(initial_cash),
-                risk_per_trade=float(risk_per_trade),
-                retrain_every=int(r_every),
-                train_lookback_days=int(lb),
-                model_exit=bool(model_exit),
-                cooldown_days=int(cooldown_days),
-            )
-
-            # FULL metrics (entire run)
-            full = summarize_window(trades_df, equity_df, initial_equity=float(initial_cash))
-            # HOLDOUT metrics (windowed)
-            hold = summarize_window(trades_df, equity_df, metrics_start=ms, metrics_end=me)
-
-            for kk, vv in full.items():
-                row[f"full_{kk}"] = vv
-            for kk, vv in hold.items():
-                row[f"holdout_{kk}"] = vv
-
-            # Filter small holdout samples (prevents overfitting on tiny #trades)
-            hold_trades = row.get("holdout_trades", 0) or 0
-            try:
-                hold_trades = int(hold_trades)
-            except Exception:
-                hold_trades = 0
-
-            if hold_trades < int(min_holdout_trades):
-                row["status"] = "filtered_min_trades"
-
-            # Objective for ranking
-            obj = objective_value(row, objective)
-            row["objective"] = float(obj) if np.isfinite(obj) else -1e9
-
-        except Exception as e:
-            row["status"] = "error"
-            row["error"] = repr(e)
-            row["objective"] = -1e12
-
-        rows.append(row)
+        # Summary line once all workers are done
+        ok_count = sum(1 for r in rows if r.get("status") == "ok")
+        err_count = sum(1 for r in rows if r.get("status") == "error")
+        print(f"Parallel sweep complete — {ok_count} ok, {err_count} errors out of {total} configs.")
 
     df = pd.DataFrame(rows)
 
@@ -491,6 +581,17 @@ def main() -> None:
     p.add_argument("--tag", type=str, default=None, help="Tag appended to outputs / runId")
     p.add_argument("--out-dir", type=str, default="backtests", help="Output directory for results")
     p.add_argument("--save-top-k", type=int, default=0, help="If >0, re-run the top K configs and save trades/equity")
+    p.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel workers for the sweep. "
+            "1 = sequential (default). "
+            "-1 = all CPU cores. "
+            "N = exactly N cores."
+        ),
+    )
 
     # Keep your current dashboard working while you migrate the backend to /runs/**
     p.add_argument(
@@ -536,6 +637,7 @@ def main() -> None:
         model_exit=not bool(args.no_model_exit),
         objective=str(args.objective),
         min_holdout_trades=int(args.min_holdout_trades),
+        n_jobs=int(args.jobs),
     )
 
     backtests_dir = Path(args.out_dir)
