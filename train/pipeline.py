@@ -83,12 +83,77 @@ def save_pruned_features(ticker: str, pruned: list[str], version_dir: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Raw data download + clean
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Keywords that indicate a TwelveData rate-limit / quota exhaustion response.
+_RATELIMIT_KEYWORDS = (
+    "credit", "rate limit", "rate_limit", "quota",
+    "too many", "429", "limit reached", "exceeded", "throttl",
+)
+
+
+def _is_ratelimit_error(exc: Exception) -> bool:
+    """Return True if *exc* looks like a TwelveData rate-limit or quota error."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _RATELIMIT_KEYWORDS)
+
+
+def _download_raw_ohlcv_yfinance(ticker: str) -> pd.DataFrame:
+    """
+    Last-resort OHLCV download via yfinance.
+
+    Used when TwelveData (SDK + HTTP) is rate-limited or unavailable.
+    auto_adjust=True mirrors TwelveData adjustment="all" (splits + dividends).
+    """
+    import yfinance as yf
+
+    logging.info("%s: downloading from yfinance (fallback)", ticker)
+    df = yf.download(
+        ticker,
+        period="max",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+    )
+
+    if df.empty:
+        raise ValueError(f"yfinance returned empty data for {ticker}")
+
+    # yfinance ≥ 0.2 returns flat columns for a single ticker, but guard anyway.
+    if hasattr(df.columns, "levels"):
+        df.columns = df.columns.get_level_values(0)
+
+    # Keep only standard OHLCV columns (yfinance may include Dividends etc.)
+    cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+    df = df[cols].copy().astype(float)
+
+    # Ensure UTC-aware DatetimeIndex (yfinance daily bars are often tz-naive).
+    if df.index.tz is None:
+        df.index = pd.to_datetime(df.index).tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+    df.index.name = "datetime"
+
+    logging.info("%s: yfinance returned %d rows", ticker, len(df))
+    return df.sort_index()
+
+
 @retry(
     retry=retry_if_exception_type(Exception),
     wait=wait_exponential(multiplier=1, min=1, max=10),
     stop=stop_after_attempt(3),
 )
 def _download_raw_ohlcv(ticker: str) -> pd.DataFrame:
+    """
+    Download OHLCV with a three-level fallback chain:
+
+      1. TwelveData SDK  (preferred – supports adjustment parameter)
+      2. TwelveData HTTP (if SDK raises TypeError for the adjustment kwarg)
+      3. yfinance        (if TwelveData is rate-limited / quota exhausted)
+
+    Rate-limit errors short-circuit to the next level immediately; other errors
+    are propagated so that tenacity can retry the whole chain.
+    """
+    # ── 1. TwelveData SDK ────────────────────────────────────────────────────
     try:
         df = td.time_series(
             symbol=ticker,
@@ -97,10 +162,36 @@ def _download_raw_ohlcv(ticker: str) -> pd.DataFrame:
             timezone="UTC",
             adjustment=ADJUSTMENT_MODE,
         ).as_pandas()
-    except TypeError:
-        logging.warning("⚠️  TDClient.time_series doesn't support 'adjustment'; using HTTP fallback with adjustment=%s", ADJUSTMENT_MODE)
-        df = _download_raw_ohlcv_http(ticker)
         return df.sort_index()
+    except TypeError:
+        # Older SDK build: 'adjustment' kwarg not supported → fall to HTTP.
+        logging.warning(
+            "⚠️  TDClient.time_series doesn't support 'adjustment'; "
+            "trying HTTP fallback (adjustment=%s)", ADJUSTMENT_MODE
+        )
+    except Exception as exc:
+        if _is_ratelimit_error(exc):
+            logging.warning(
+                "⚠️  TwelveData SDK rate-limited for %s (%s); trying HTTP…",
+                ticker, exc,
+            )
+        else:
+            raise  # transient network error → let tenacity retry
+
+    # ── 2. TwelveData HTTP ───────────────────────────────────────────────────
+    try:
+        return _download_raw_ohlcv_http(ticker)
+    except Exception as exc:
+        if _is_ratelimit_error(exc):
+            logging.warning(
+                "⚠️  TwelveData HTTP rate-limited for %s (%s); "
+                "falling back to yfinance…", ticker, exc,
+            )
+        else:
+            raise  # transient error → let tenacity retry
+
+    # ── 3. yfinance fallback ─────────────────────────────────────────────────
+    return _download_raw_ohlcv_yfinance(ticker)
 
 
 def cached_download(ticker: str) -> pd.DataFrame:
