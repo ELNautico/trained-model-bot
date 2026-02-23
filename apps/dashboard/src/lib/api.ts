@@ -1,5 +1,6 @@
 import { notifications } from '@mantine/notifications';
 import type { RunDetail, RunSummary, RunTopKItem, EquityPoint } from '../types/runs';
+import type { PaperSummary, PaperPosition, PaperTrade, PaperEquityPoint } from '../types/paper';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '/api';
 
@@ -48,4 +49,10 @@ export const api = {
   listTopK: (runId: string) => fetchJson<RunTopKItem[]>(apiUrl(`/runs/${encodeURIComponent(runId)}/topk`)),
   downloadTopKCsvUrl: (runId: string, rank: number, which: 'trades' | 'equity') =>
     apiUrl(`/runs/${encodeURIComponent(runId)}/topk/${encodeURIComponent(String(rank))}/download/${encodeURIComponent(which)}`),
+
+  // Paper trading
+  getPaperSummary: () => fetchJson<PaperSummary>(apiUrl('/paper/summary')),
+  getPaperPositions: () => fetchJson<PaperPosition[]>(apiUrl('/paper/positions')),
+  getPaperTrades: () => fetchJson<PaperTrade[]>(apiUrl('/paper/trades')),
+  getPaperEquity: () => fetchJson<PaperEquityPoint[]>(apiUrl('/paper/equity')),
 };

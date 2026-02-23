@@ -2,6 +2,7 @@ import { AppShell, Group, Title, Anchor, Text } from '@mantine/core';
 import { Routes, Route, Navigate, Link } from 'react-router-dom';
 import RunsListPage from './pages/RunsListPage';
 import RunDetailPage from './pages/RunDetailPage';
+import PaperPage from './pages/PaperPage';
 
 export default function App() {
   return (
@@ -12,6 +13,9 @@ export default function App() {
             <Title order={4}>Trading Research Dashboard</Title>
             <Anchor component={Link} to="/runs">
               Runs
+            </Anchor>
+            <Anchor component={Link} to="/paper">
+              Paper Trading
             </Anchor>
           </Group>
 
@@ -26,6 +30,7 @@ export default function App() {
           <Route path="/" element={<Navigate to="/runs" replace />} />
           <Route path="/runs" element={<RunsListPage />} />
           <Route path="/runs/:runId" element={<RunDetailPage />} />
+          <Route path="/paper" element={<PaperPage />} />
           <Route path="*" element={<Navigate to="/runs" replace />} />
         </Routes>
       </AppShell.Main>
