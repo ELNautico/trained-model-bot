@@ -94,13 +94,13 @@ export default function RunDetailPage() {
       setTopkEquityLoading({});
 
       // For backtest runs, auto-fetch equity curve
-      if (d?.run?.kind === ‘backtest’) {
-        const eq = await safe<EquityPoint[]>(api.getEquityCurve(runId), ‘Failed to load equity curve’);
+      if (d?.run?.kind === 'backtest') {
+        const eq = await safe<EquityPoint[]>(api.getEquityCurve(runId), 'Failed to load equity curve');
         setEquityCurve(eq ?? null);
       }
 
-      // Try loading top-k; if endpoint isn’t present, safe() returns null and we keep empty
-      const tk = await safe<RunTopKItem[]>(api.listTopK(runId), ‘Failed to load top-k artifacts’);
+      // Try loading top-k; if endpoint isn't present, safe() returns null and we keep empty
+      const tk = await safe<RunTopKItem[]>(api.listTopK(runId), 'Failed to load top-k artifacts');
       setTopk(tk ?? []);
     })();
   }, [runId]);
