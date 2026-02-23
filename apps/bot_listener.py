@@ -21,7 +21,10 @@ from core.storage import (
 from .jobs import signal_job, evaluate_job, positions_job, paper_positions_job, help_job
 
 # --- load config ---
-_cfg = toml.load(Path(__file__).with_name("config.toml"))
+_cfg_path = Path(__file__).with_name("config.toml")
+if not _cfg_path.exists():
+    _cfg_path = Path(__file__).parent.parent / "config.toml"
+_cfg = toml.load(_cfg_path)
 TOKEN = _cfg["telegram"]["bot_token"]
 AUTHORIZED_CHAT_ID = str(_cfg["telegram"]["chat_id"])
 
