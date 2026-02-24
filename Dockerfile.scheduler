@@ -5,4 +5,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app
-CMD ["python", "-m", "apps.bot_listener"]
+CMD ["python", "-m", "apps.scheduler_runner"]

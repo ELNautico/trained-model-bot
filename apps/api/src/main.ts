@@ -7,9 +7,9 @@ async function bootstrap() {
   // All routes will be under /api/...
   app.setGlobalPrefix('api');
 
-  // Vite default dev origin
+  const corsOrigin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
   app.enableCors({
-    origin: ['http://localhost:5173'],
+    origin: corsOrigin.split(','),
     credentials: true,
   });
 

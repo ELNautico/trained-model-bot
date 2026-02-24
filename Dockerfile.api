@@ -1,0 +1,16 @@
+FROM node:20-slim AS builder
+WORKDIR /app
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+COPY apps/api/package*.json ./
+RUN npm ci
+COPY apps/api .
+RUN npm run build
+
+FROM node:20-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/package.json .
+EXPOSE 3000
+CMD ["node", "dist/main"]

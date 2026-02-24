@@ -1,0 +1,14 @@
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+cache/
+models/
+models_signals/
+backtests/
+logs/
+config.toml
+.claude/
+.git/
+*.log

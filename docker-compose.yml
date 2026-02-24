@@ -1,9 +1,53 @@
 version: '3.8'
+
+volumes:
+  db-data:
+  cache-data:
+  models-data:
+  backtests-data:
+
 services:
-  trained-model-bot:
+  bot:
     build:
       context: .
       dockerfile: Dockerfile.bot
-    container_name: trained-model-bot
     restart: unless-stopped
-    tty: true
+    volumes:
+      - db-data:/app/core
+      - ./config.toml:/app/config.toml:ro
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    restart: unless-stopped
+    volumes:
+      - db-data:/app/core
+      - cache-data:/app/cache
+      - models-data:/app/models_signals
+      - ./config.toml:/app/config.toml:ro
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - db-data:/data/db
+      - backtests-data:/data/backtests
+    environment:
+      - BOTDB_PATH=/data/db/bot.db
+      - BACKTESTS_DIR=/data/backtests
+      - CORS_ORIGIN=http://localhost
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api
