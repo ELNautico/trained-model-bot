@@ -10,6 +10,11 @@ models/
 # Logs / DB
 trading_log.txt
 bot.db
+bot.db-shm
+bot.db-wal
+core/bot.db
+core/bot.db-shm
+core/bot.db-wal
 # IDE
 .vscode/
 tuning_logs/
