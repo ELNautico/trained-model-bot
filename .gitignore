@@ -27,3 +27,4 @@ package-lock.json
 ./claude
 CLAUDE.md
 .gitignore
+.claude/settings.local.json
