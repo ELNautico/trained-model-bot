@@ -1,20 +1,25 @@
-import { Card, Group, Text, Title } from '@mantine/core';
+import { Card, Text, Title } from '@mantine/core';
 
 export default function MetricCard(props: {
   label: string;
   value: string;
   sub?: string;
+  valueColor?: string;
 }) {
   return (
     <Card withBorder radius="md" p="md">
       <Text size="sm" c="dimmed">
         {props.label}
       </Text>
-      <Group justify="space-between" align="end" mt={6}>
-        <Title order={3}>{props.value}</Title>
-      </Group>
+      <Title
+        order={3}
+        mt={6}
+        style={props.valueColor ? { color: props.valueColor } : undefined}
+      >
+        {props.value}
+      </Title>
       {props.sub ? (
-        <Text size="xs" c="dimmed" mt={6}>
+        <Text size="xs" c="dimmed" mt={4}>
           {props.sub}
         </Text>
       ) : null}
